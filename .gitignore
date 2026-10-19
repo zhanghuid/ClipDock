@@ -54,3 +54,25 @@ Screenshot*.png
 SCR-*.png
 *.app/
 *.dmg
+
+# 本地调试产物（不入库，保留在磁盘）
+events.jsonl
+config.json
+views.json
+test_title_api.swift
+*.jpg
+*.jpeg
+.claude-plugin/
+labels/
+sessions/
+statuses/
+
+# 实现过程记录（本地保留）
+FEATURE_SUMMARY.md
+IMPLEMENTATION_PROGRESS.md
+README_IMPLEMENTATION.md
+TITLE_EDITING_IMPLEMENTATION.md
+iCLOUD_SYNC_MIGRATION.md
+实现总结.md
+最终实现总结.md
+
