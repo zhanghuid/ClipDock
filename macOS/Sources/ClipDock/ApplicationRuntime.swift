@@ -263,9 +263,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func showPreferences(_ sender: Any?) {
-        refreshAccessibilityPermissionState()
+        // 先让设置窗口出现，再做面板收起与权限刷新，避免首帧被这些同步工作阻塞。
         preferencesController.showPreferences()
         panelController.hideUnlessBlockingPanelOperation(restoresPreviousApplicationFocus: false)
+        refreshAccessibilityPermissionState()
     }
 
     @objc func showAbout(_ sender: Any?) {
@@ -512,6 +513,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 accessibilityPermissionController.openAccessibilitySettings()
             }
         )
+        accessibilityPermissionController.onStateRefreshed = { [weak self] state in
+            self?.preferencesController.updateAccessibilityPermissionState(state)
+        }
+        accessibilityPermissionController.preloadState()
 
         maintenanceCoordinator = StorageMaintenanceCoordinator(
             openCoreOperation: { [client, appSupportURL] in
@@ -1723,7 +1728,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func refreshAccessibilityPermissionState() {
         let state = preferencesCoordinator?.refreshAccessibilityPermissionState()
-            ?? accessibilityPermissionController.currentState()
+            ?? accessibilityPermissionController.refreshState()
         preferencesController.updateAccessibilityPermissionState(state)
     }
 

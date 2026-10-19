@@ -116,6 +116,11 @@ public final class PreferencesSceneController {
     public func updateAccessibilityPermissionState(
         _ accessibilityPermissionState: AccessibilityPermissionPresentation
     ) -> PreferencesSceneUpdate {
+        // 状态未变化时不触发重绘：应用每次激活都会刷新权限状态，
+        // 即使结果相同也会让当前设置页整体重排一次，造成可见的卡顿。
+        guard state.accessibilityPermissionState != accessibilityPermissionState else {
+            return noOpUpdate()
+        }
         state.accessibilityPermissionState = accessibilityPermissionState
         guard state.selectedSection == .rules else {
             return noOpUpdate()

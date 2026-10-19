@@ -126,6 +126,7 @@ public final class PreferencesCoordinator {
             applyRequestedChange: launchAtLoginChanged
         )
 
+        let previousPreferences = currentPreferences
         switch savePreferencesOperation(reconciliation.preferences) {
         case .success(let result):
             currentPreferences = result.preferences
@@ -134,12 +135,29 @@ public final class PreferencesCoordinator {
                 launchAtLoginState: reconciliation.launchAtLoginState,
                 accessibilityPermissionState: currentAccessibilityPermissionState(),
                 statusText: reconciliation.statusText ?? AppLocalization.text("preferences.saved", defaultValue: "偏好：已保存"),
-                shouldRefreshList: true
+                shouldRefreshList: Self.affectsClipboardList(
+                    previous: previousPreferences,
+                    next: result.preferences
+                )
             ))
 
         case .failure(let error):
             return .failure(error)
         }
+    }
+
+    /// 纯外观类偏好不会改变列表内容，无需重查列表。
+    /// 其余设置保持不变（影响采集、过滤、保留策略，或与既有行为一致）。
+    /// 之前任何一项（含主题、预览浮层等）保存后都会触发一次列表查询。
+    private static func affectsClipboardList(
+        previous: RustPreferencesDocument,
+        next: RustPreferencesDocument
+    ) -> Bool {
+        previous.general != next.general
+            || previous.history != next.history
+            || previous.linkPreview != next.linkPreview
+            || previous.shortcuts != next.shortcuts
+            || previous.ignoreList != next.ignoreList
     }
 
     public func refreshAccessibilityPermissionState() -> AccessibilityPermissionPresentation {

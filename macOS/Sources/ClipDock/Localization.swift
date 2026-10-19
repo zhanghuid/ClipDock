@@ -5,8 +5,46 @@ enum AppLocalization {
         if isRunningPackageTests {
             return defaultValue
         }
-        return NSLocalizedString(key, bundle: ClipDockResources.bundle, value: defaultValue, comment: "")
+        // 设置界面重绘时同一批 key 会被反复查询（每次都是一次 Bundle 查找）。
+        // 文案在进程内不变，按 key 缓存即可；key 数量有限，缓存规模可控。
+        return cache.value(for: CacheKey(key: key, defaultValue: defaultValue)) {
+            NSLocalizedString(
+                key,
+                bundle: ClipDockResources.bundle,
+                value: defaultValue,
+                comment: ""
+            )
+        }
     }
+
+    private struct CacheKey: Hashable {
+        let key: String
+        let defaultValue: String
+    }
+
+    /// 界面构建在主线程，但导出/后台任务也可能取文案，用锁保护。
+    private final class TextCache: @unchecked Sendable {
+        private var storage: [CacheKey: String] = [:]
+        private let lock = NSLock()
+
+        func value(for key: CacheKey, make: () -> String) -> String {
+            lock.lock()
+            if let cached = storage[key] {
+                lock.unlock()
+                return cached
+            }
+            lock.unlock()
+
+            let resolved = make()
+
+            lock.lock()
+            storage[key] = resolved
+            lock.unlock()
+            return resolved
+        }
+    }
+
+    private static let cache = TextCache()
 
     static func format(_ key: String, defaultValue: String, _ arguments: CVarArg...) -> String {
         String(
@@ -33,13 +71,16 @@ enum AppLocalization {
         }
     }
 
-    private static var isRunningPackageTests: Bool {
+    /// 进程内不会改变，只计算一次。
+    /// 该判断在每次取本地化文案时都会走，之前每次访问都要读环境变量并遍历命令行参数，
+    /// 设置界面一次重绘就会有上百次调用，是切换页面卡顿的主要开销之一。
+    private static let isRunningPackageTests: Bool = {
         let processInfo = ProcessInfo.processInfo
         return processInfo.processName.contains("PackageTests")
             || Bundle.main.bundlePath.contains("PackageTests")
             || CommandLine.arguments.contains { $0.contains("PackageTests") || $0.contains(".xctest") }
             || processInfo.environment["XCTestConfigurationFilePath"] != nil
-    }
+    }()
 }
 
 enum ClipDockResources {

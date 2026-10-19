@@ -2,6 +2,7 @@ import AppKit
 import ApplicationServices
 import Carbon.HIToolbox
 import ClipboardPanelApp
+import Combine
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -401,10 +402,48 @@ typealias AccessibilityPermissionState = AccessibilityPermissionPresentation
 
 @MainActor
 final class AccessibilityPermissionController {
+    /// `AXIsProcessTrusted()` 会同步询问系统，首次调用实测约 24ms。
+    /// 每次打开设置都会走一次，先返回上次结果、再异步刷新，避免首帧被阻塞。
+    private var lastKnownState: AccessibilityPermissionState?
+    private var isRefreshing = false
+    var onStateRefreshed: ((AccessibilityPermissionState) -> Void)?
+
     func currentState() -> AccessibilityPermissionState {
-        AccessibilityPermissionPresenter.presentation(
+        if let lastKnownState {
+            refreshInBackground()
+            return lastKnownState
+        }
+        return refreshState()
+    }
+
+    /// 强制同步读取（保存偏好、用户点击“重新检查”等需要准确值的场景）。
+    @discardableResult
+    func refreshState() -> AccessibilityPermissionState {
+        let state = AccessibilityPermissionPresenter.presentation(
             status: AXIsProcessTrusted() ? .trusted : .notTrusted
         )
+        lastKnownState = state
+        return state
+    }
+
+    /// 启动时预取，让设置窗口打开时无需等待系统查询。
+    func preloadState() {
+        _ = refreshState()
+    }
+
+    private func refreshInBackground() {
+        guard !isRefreshing else { return }
+        isRefreshing = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.isRefreshing = false
+            let state = AccessibilityPermissionPresenter.presentation(
+                status: AXIsProcessTrusted() ? .trusted : .notTrusted
+            )
+            guard state != self.lastKnownState else { return }
+            self.lastKnownState = state
+            self.onStateRefreshed?(state)
+        }
     }
 
     func openAccessibilitySettings() {
@@ -441,6 +480,7 @@ final class PreferencesWindowController: NSWindowController {
     private let viewModel = PreferencesSwiftUIViewModel()
     private let toolbarCoordinator = PreferencesToolbarCoordinator()
     private var splitViewController: PreferencesSplitViewController?
+    private var appliedAppearanceName: NSAppearance.Name?
     private var theme: ClipDockPreferencesTheme {
         viewModel.preferencesTheme(fallbackAppearance: window?.effectiveAppearance)
     }
@@ -513,7 +553,9 @@ final class PreferencesWindowController: NSWindowController {
             window.center()
         }
 
-        applyTheme()
+        // 外观未变化时 applyTheme 会整树遍历视图并重设背景色；
+        // 只在确实需要时执行，避免每次打开设置都付出一次全树布局代价。
+        applyThemeIfNeeded()
         showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
@@ -575,6 +617,13 @@ final class PreferencesWindowController: NSWindowController {
     private func applyTheme() {
         window?.backgroundColor = theme.windowBackgroundColor
         splitViewController?.applyTheme()
+    }
+
+    private func applyThemeIfNeeded() {
+        let appearanceName = viewModel.forcedAppearance?.name ?? window?.effectiveAppearance.name
+        guard appearanceName != appliedAppearanceName else { return }
+        appliedAppearanceName = appearanceName
+        applyTheme()
     }
 
     func preferencesShellSmokeSnapshot() -> PreferencesShellSmokeSnapshot? {
@@ -982,14 +1031,15 @@ private final class PreferencesSplitViewController: NSSplitViewController {
 
     private let model: PreferencesSwiftUIViewModel
     private let sidebarController: NSHostingController<PreferencesSidebarList>
-    private let contentController: NSHostingController<PreferencesContent>
+    private let contentController: PreferencesContentContainerController
     private var didApplyInitialSidebarWidth = false
     private var pendingDeferredThemeRefresh = false
+    private var appliedAppearanceName: NSAppearance.Name?
 
     init(model: PreferencesSwiftUIViewModel) {
         self.model = model
         self.sidebarController = NSHostingController(rootView: PreferencesSidebarList(model: model))
-        self.contentController = NSHostingController(rootView: PreferencesContent(model: model))
+        self.contentController = PreferencesContentContainerController(model: model)
 
         super.init(nibName: nil, bundle: nil)
 
@@ -1033,16 +1083,27 @@ private final class PreferencesSplitViewController: NSSplitViewController {
     override func viewDidLayout() {
         super.viewDidLayout()
 
-        applyTheme()
-        scheduleDeferredThemeRefresh()
+        // 布局可能被高频触发（分区切换、窗口尺寸变化、SwiftUI 内嵌滚动视图刷新）。
+        // 之前每次布局都整树遍历并再排一次异步主题刷新，等于把开销放大一倍以上。
+        // 主题只依赖外观，外观不变就无需重复应用。
+        applyThemeIfNeeded()
         guard !didApplyInitialSidebarWidth, splitViewItems.count > 1 else { return }
         didApplyInitialSidebarWidth = true
         splitView.setPosition(Layout.sidebarPreferredWidth, ofDividerAt: 0)
     }
 
+    private func applyThemeIfNeeded() {
+        let forcedAppearance = model.forcedAppearance
+        let appearanceKey = forcedAppearance?.name ?? view.effectiveAppearance.name
+        guard appearanceKey != appliedAppearanceName else { return }
+        applyTheme()
+    }
+
     func applyTheme() {
         let preferencesTheme = model.preferencesTheme(fallbackAppearance: view.effectiveAppearance)
         let forcedAppearance = model.forcedAppearance
+        appliedAppearanceName = forcedAppearance?.name ?? view.effectiveAppearance.name
+        pendingDeferredThemeRefresh = false
         view.window?.appearance = forcedAppearance
         view.wantsLayer = true
         splitView.wantsLayer = true
@@ -1054,16 +1115,19 @@ private final class PreferencesSplitViewController: NSSplitViewController {
         splitView.layer?.backgroundColor = preferencesTheme.contentBackgroundColor.cgColor
         // NSSplitViewItem supplies the system material, including Liquid Glass on macOS 26.
         sidebarController.view.layer?.backgroundColor = NSColor.clear.cgColor
-        contentController.view.layer?.backgroundColor = preferencesTheme.contentBackgroundColor.cgColor
+        contentController.setBackgroundColor(preferencesTheme.contentBackgroundColor)
+        contentController.applyAppearance(forcedAppearance)
         view.window?.backgroundColor = preferencesTheme.windowBackgroundColor
         configureScrollViews(
             in: sidebarController.view,
             backgroundColor: .clear
         )
-        configureScrollViews(
-            in: contentController.view,
-            backgroundColor: preferencesTheme.contentBackgroundColor
-        )
+        for pageView in contentController.pageViews {
+            configureScrollViews(
+                in: pageView,
+                backgroundColor: preferencesTheme.contentBackgroundColor
+            )
+        }
     }
 
     private func scheduleDeferredThemeRefresh() {
@@ -1125,27 +1189,57 @@ private final class PreferencesSplitViewController: NSSplitViewController {
         )
     }
 
+    /// 递归遍历整棵 AppKit 视图树。只在主题/外观真正变化时调用一次，
+    /// 且对已经配置过的节点直接跳过，避免反复改写背景色触发重绘。
     private func configureScrollViews(
         in view: NSView,
         backgroundColor: NSColor
     ) {
+        var visited = Set<ObjectIdentifier>()
+        configureScrollViews(in: view, backgroundColor: backgroundColor, visited: &visited)
+    }
+
+    private func configureScrollViews(
+        in view: NSView,
+        backgroundColor: NSColor,
+        visited: inout Set<ObjectIdentifier>
+    ) {
+        guard visited.insert(ObjectIdentifier(view)).inserted else { return }
+
         if let scrollView = view as? NSScrollView {
-            scrollView.drawsBackground = false
-            scrollView.backgroundColor = backgroundColor
-            scrollView.contentView.drawsBackground = false
-            scrollView.contentView.backgroundColor = backgroundColor
+            if scrollView.drawsBackground {
+                scrollView.drawsBackground = false
+            }
+            if scrollView.backgroundColor != backgroundColor {
+                scrollView.backgroundColor = backgroundColor
+            }
+            if scrollView.contentView.drawsBackground {
+                scrollView.contentView.drawsBackground = false
+            }
+            if scrollView.contentView.backgroundColor != backgroundColor {
+                scrollView.contentView.backgroundColor = backgroundColor
+            }
         }
 
         if let tableView = view as? NSTableView {
-            tableView.backgroundColor = backgroundColor
-            tableView.enclosingScrollView?.drawsBackground = false
-            tableView.enclosingScrollView?.backgroundColor = backgroundColor
+            if tableView.backgroundColor != backgroundColor {
+                tableView.backgroundColor = backgroundColor
+            }
+            if let enclosing = tableView.enclosingScrollView {
+                if enclosing.drawsBackground {
+                    enclosing.drawsBackground = false
+                }
+                if enclosing.backgroundColor != backgroundColor {
+                    enclosing.backgroundColor = backgroundColor
+                }
+            }
         }
 
-        view.subviews.forEach {
+        for subview in view.subviews {
             configureScrollViews(
-                in: $0,
-                backgroundColor: backgroundColor
+                in: subview,
+                backgroundColor: backgroundColor,
+                visited: &visited
             )
         }
     }
@@ -1160,9 +1254,19 @@ private struct PreferencesThemeValues {
     let palette: ClipDockPreferencesTheme
 
     init(colorScheme: ColorScheme) {
-        let appearance = NSAppearance(named: colorScheme == .dark ? .darkAqua : .aqua)
-        self.palette = ClipDockTheme.current(for: appearance).preferences
+        self.palette = colorScheme == .dark ? Self.darkPalette : Self.lightPalette
     }
+
+    // 每个设置行都会读取 `colors`，而 `ClipDockTheme.current(for:)` 每次都会构造
+    // NSAppearance 并做一次 bestMatch 匹配。主题调色板本身是不可变的静态数据，
+    // 按外观缓存一次即可，避免每次重绘都重复创建。
+    private static let lightPalette: ClipDockPreferencesTheme = {
+        ClipDockTheme.current(for: NSAppearance(named: .aqua)).preferences
+    }()
+
+    private static let darkPalette: ClipDockPreferencesTheme = {
+        ClipDockTheme.current(for: NSAppearance(named: .darkAqua)).preferences
+    }()
 
     var windowBackground: Color { Color(nsColor: palette.windowBackgroundColor) }
     var contentBackground: Color { Color(nsColor: palette.contentBackgroundColor) }
@@ -1297,22 +1401,117 @@ private struct PreferenceMiniAppIconView: View {
     }
 }
 
-private struct PreferencesContent: View {
+/// 设置窗口右侧内容区。
+///
+/// 每个分区的 SwiftUI 页面只在首次进入时构建一次，之后常驻并缓存，
+/// 切换分区只做显隐。此前内容区是一个整体 `PreferencesContent`，
+/// 每次点侧栏都会让 SwiftUI 销毁旧页面并重建新页面（连同所有原生开关、
+/// 输入框与滚动视图），单次耗时 30–100ms，连续点击就会明显卡顿。
+@MainActor
+private final class PreferencesContentContainerController: NSViewController {
+    private let model: PreferencesSwiftUIViewModel
+    private var pageControllers: [PreferenceSection: NSHostingController<PreferencePageHost>] = [:]
+    private var currentSection: PreferenceSection?
+    private var contentObservation: AnyCancellable?
+
+    init(model: PreferencesSwiftUIViewModel) {
+        self.model = model
+        super.init(nibName: nil, bundle: nil)
+        // 分区变化时只切换显隐，不重建页面。
+        contentObservation = model.$state
+            .map(\.selectedSection)
+            .removeDuplicates()
+            .sink { [weak self] _ in
+                self?.syncVisiblePage()
+            }
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override func loadView() {
+        let container = NSView()
+        container.wantsLayer = true
+        view = container
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        syncVisiblePage()
+    }
+
+    func syncVisiblePage() {
+        guard isViewLoaded else { return }
+        let section = model.selectedSection
+        guard section != currentSection else { return }
+
+        let controller = pageController(for: section)
+        for (cachedSection, cachedController) in pageControllers where cachedSection != section {
+            cachedController.view.isHidden = true
+        }
+        if controller.parent !== self {
+            addChild(controller)
+        }
+        if controller.view.superview !== view {
+            controller.view.frame = view.bounds
+            controller.view.autoresizingMask = [.width, .height]
+            view.addSubview(controller.view)
+        }
+        controller.view.isHidden = false
+        controller.view.frame = view.bounds
+        controller.view.appearance = model.forcedAppearance
+        currentSection = section
+    }
+
+    private func pageController(for section: PreferenceSection) -> NSHostingController<PreferencePageHost> {
+        if let cached = pageControllers[section] {
+            return cached
+        }
+        let controller = NSHostingController(
+            rootView: PreferencePageHost(model: model, section: section)
+        )
+        controller.view.frame = view.bounds
+        controller.view.autoresizingMask = [.width, .height]
+        pageControllers[section] = controller
+        return controller
+    }
+
+    var pageViews: [NSView] {
+        pageControllers.values.map(\.view)
+    }
+
+    func setBackgroundColor(_ color: NSColor) {
+        view.wantsLayer = true
+        view.layer?.backgroundColor = color.cgColor
+        for controller in pageControllers.values {
+            controller.view.wantsLayer = true
+            controller.view.layer?.backgroundColor = color.cgColor
+        }
+    }
+
+    func applyAppearance(_ appearance: NSAppearance?) {
+        for controller in pageControllers.values {
+            controller.view.appearance = appearance
+        }
+    }
+}
+
+/// 单个设置分区页面。由 `PreferencesContentContainerController` 按需创建并缓存，
+/// 页面只订阅自身分区所需状态，切换分区时不再整页重建。
+private struct PreferencePageHost: View {
     @ObservedObject var model: PreferencesSwiftUIViewModel
+    let section: PreferenceSection
     @Environment(\.colorScheme) private var colorScheme
 
     private var colors: PreferencesThemeValues {
-        PreferencesThemeValues(colorScheme: effectiveColorScheme)
-    }
-
-    private var effectiveColorScheme: ColorScheme {
-        model.resolvedColorScheme(systemColorScheme: colorScheme)
+        PreferencesThemeValues(colorScheme: model.resolvedColorScheme(systemColorScheme: colorScheme))
     }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
-                PreferencePageHeader(section: model.selectedSection)
+                PreferencePageHeader(section: section)
                 pageContent
             }
             .frame(maxWidth: 760, alignment: .leading)
@@ -1321,18 +1520,18 @@ private struct PreferencesContent: View {
             .padding(.bottom, 48)
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .scrollContentBackground(.hidden)
         .background(colors.contentBackground.ignoresSafeArea())
-        .environment(\.colorScheme, effectiveColorScheme)
+        .environment(
+            \.colorScheme,
+            model.resolvedColorScheme(systemColorScheme: colorScheme)
+        )
     }
 
     @ViewBuilder
     private var pageContent: some View {
-        switch model.selectedSection {
-        case .general, .appearance:
-            PreferenceGeneralSection(model: model)
-        case .history:
+        switch section {
+        case .general, .appearance, .history:
             PreferenceGeneralSection(model: model)
         case .shortcuts:
             PreferenceShortcutSection(model: model)
@@ -1795,9 +1994,31 @@ private struct IgnoredApplicationsPicker: View {
         PreferencesThemeValues(colorScheme: colorScheme)
     }
 
+    @State private var cachedDescriptors: (identifiers: [String], descriptors: [IgnoredApplicationDescriptor])?
+    @State private var isLoadingDescriptors = false
+
     private var descriptors: [IgnoredApplicationDescriptor] {
-        model.state.preferences.ignoreList.ignoredAppIdentifiers.map {
-            IgnoredApplicationDescriptor(ruleIdentifier: $0)
+        let identifiers = model.state.preferences.ignoreList.ignoredAppIdentifiers
+        if let cached = cachedDescriptors, cached.identifiers == identifiers {
+            return cached.descriptors
+        }
+        // 每个描述符都要读 Bundle、查 LaunchServices 并加载应用图标（磁盘 I/O），
+        // 实测首次进入隐私页会阻塞主线程约 100ms。body 里先用占位数据，
+        // 真正的解析放到后台，完成后再刷新。
+        scheduleDescriptorResolution(for: identifiers)
+        return identifiers.map(IgnoredApplicationDescriptor.placeholder(for:))
+    }
+
+    private func scheduleDescriptorResolution(for identifiers: [String]) {
+        guard !isLoadingDescriptors else { return }
+        guard cachedDescriptors?.identifiers != identifiers else { return }
+        isLoadingDescriptors = true
+        Task { @MainActor in
+            let resolved = await Task.detached(priority: .userInitiated) {
+                identifiers.map(IgnoredApplicationDescriptor.init(ruleIdentifier:))
+            }.value
+            cachedDescriptors = (identifiers, resolved)
+            isLoadingDescriptors = false
         }
     }
 
@@ -2102,6 +2323,28 @@ struct IgnoredApplicationDescriptor: Identifiable {
         self.icon = applicationURL.map { NSWorkspace.shared.icon(forFile: $0.path) }
             ?? NSImage(systemSymbolName: "app.dashed", accessibilityDescription: displayName)
             ?? NSImage(size: NSSize(width: 32, height: 32))
+    }
+
+    /// 图标与 Bundle 读取较慢，先用占位值渲染，后台解析完成后替换。
+    static func placeholder(for ruleIdentifier: String) -> IgnoredApplicationDescriptor {
+        let trimmed = ruleIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallbackIcon = NSImage(
+            systemSymbolName: "app.dashed",
+            accessibilityDescription: trimmed
+        ) ?? NSImage(size: NSSize(width: 32, height: 32))
+        return IgnoredApplicationDescriptor(
+            id: trimmed,
+            displayName: trimmed,
+            detail: trimmed,
+            icon: fallbackIcon
+        )
+    }
+
+    private init(id: String, displayName: String, detail: String, icon: NSImage) {
+        self.id = id
+        self.displayName = displayName
+        self.detail = detail
+        self.icon = icon
     }
 
     private static func applicationURL(for identifier: String) -> URL? {

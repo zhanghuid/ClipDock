@@ -105,8 +105,28 @@ extension LaunchAtLoginMigrationOutcome {
 
 @MainActor
 final class SystemLaunchAtLoginService: LaunchAtLoginServicing {
+    /// `SMAppService.mainApp.status` 是同步 XPC 查询，实测每次约 45ms，
+    /// 而每次保存任意偏好项都会重新读取登录项状态，逐个点开关时就会明显卡顿。
+    /// 这里做短时缓存；注册/注销后立即失效，保证迁移逻辑读到最新值。
+    private static var cachedStatus: LaunchAtLoginServiceStatus?
+    private static var cachedStatusAt: TimeInterval = 0
+    private static let statusCacheLifetime: TimeInterval = 30
+
     var status: LaunchAtLoginServiceStatus {
-        Self.mapStatus(SMAppService.mainApp.status)
+        let now = ProcessInfo.processInfo.systemUptime
+        if let cached = Self.cachedStatus,
+           now - Self.cachedStatusAt < Self.statusCacheLifetime {
+            return cached
+        }
+        let resolved = Self.mapStatus(SMAppService.mainApp.status)
+        Self.cachedStatus = resolved
+        Self.cachedStatusAt = now
+        return resolved
+    }
+
+    private static func invalidateStatusCache() {
+        cachedStatus = nil
+        cachedStatusAt = 0
     }
 
     static func mapStatus(_ status: SMAppService.Status) -> LaunchAtLoginServiceStatus {
@@ -126,10 +146,12 @@ final class SystemLaunchAtLoginService: LaunchAtLoginServicing {
 
     func register() throws {
         try SMAppService.mainApp.register()
+        Self.invalidateStatusCache()
     }
 
     func unregister() throws {
         try SMAppService.mainApp.unregister()
+        Self.invalidateStatusCache()
     }
 
     func openSystemSettingsLoginItems() {
