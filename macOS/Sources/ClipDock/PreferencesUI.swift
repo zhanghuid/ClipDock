@@ -12,6 +12,7 @@ enum PreferenceSection: Int, CaseIterable, Hashable {
     case history
     case shortcuts
     case rules
+    case sync
     case about
 
     static var allCases: [PreferenceSection] {
@@ -19,6 +20,7 @@ enum PreferenceSection: Int, CaseIterable, Hashable {
             .general,
             .rules,
             .shortcuts,
+            .sync,
             .about
         ]
     }
@@ -35,6 +37,8 @@ enum PreferenceSection: Int, CaseIterable, Hashable {
             return AppLocalization.text("preferences.section.shortcuts", defaultValue: "键盘快捷键")
         case .rules:
             return AppLocalization.text("preferences.section.privacy", defaultValue: "隐私")
+        case .sync:
+            return AppLocalization.text("preferences.section.sync", defaultValue: "云同步")
         case .about:
             return AppLocalization.text("preferences.section.about", defaultValue: "关于")
         }
@@ -52,6 +56,8 @@ enum PreferenceSection: Int, CaseIterable, Hashable {
             return AppLocalization.text("preferences.section.shortcuts.subtitle", defaultValue: "打开、搜索与快速取用")
         case .rules:
             return AppLocalization.text("preferences.section.privacy.subtitle", defaultValue: "来源权限与忽略应用")
+        case .sync:
+            return AppLocalization.text("preferences.section.sync.subtitle", defaultValue: "通过 S3 兼容存储在多台 Mac 间同步剪贴板")
         case .about:
             return AppLocalization.text("preferences.section.about.subtitle", defaultValue: "版本、构建与项目说明")
         }
@@ -69,6 +75,8 @@ enum PreferenceSection: Int, CaseIterable, Hashable {
             return "keyboard"
         case .rules:
             return "hand.raised"
+        case .sync:
+            return "icloud.and.arrow.up"
         case .about:
             return "info.circle"
         }
@@ -81,6 +89,7 @@ enum PreferenceSection: Int, CaseIterable, Hashable {
         case .history: .orange
         case .shortcuts: .pink
         case .rules: .blue
+        case .sync: .teal
         case .about: .indigo
         }
     }
@@ -515,6 +524,39 @@ final class PreferencesWindowController: NSWindowController {
         }
     }
 
+    // MARK: - S3 同步
+
+    var s3SettingsStore: S3SettingsStore? {
+        didSet {
+            viewModel.s3SettingsStore = s3SettingsStore
+            viewModel.loadS3Settings()
+        }
+    }
+
+    var onS3Upload: (() -> Void)? {
+        didSet { viewModel.onS3Upload = onS3Upload }
+    }
+
+    var onS3Download: (() -> Void)? {
+        didSet { viewModel.onS3Download = onS3Download }
+    }
+
+    var onS3Synchronize: (() -> Void)? {
+        didSet { viewModel.onS3Synchronize = onS3Synchronize }
+    }
+
+    var onS3Cancel: (() -> Void)? {
+        didSet { viewModel.onS3Cancel = onS3Cancel }
+    }
+
+    var onS3ConfigurationChanged: (() -> Void)? {
+        didSet { viewModel.onS3ConfigurationChanged = onS3ConfigurationChanged }
+    }
+
+    func updateS3State(_ state: S3SyncState) {
+        viewModel.s3State = state
+    }
+
     init() {
         let window = NSWindow(
             contentRect: NSRect(origin: .zero, size: Layout.defaultWindowSize),
@@ -703,6 +745,14 @@ private final class PreferencesSwiftUIViewModel: ObservableObject {
     @Published private(set) var isTransferringBackup = false
     @Published private(set) var backupStatus = ""
 
+    // MARK: - S3 同步
+
+    @Published var s3Configuration = S3SyncConfiguration()
+    @Published private(set) var s3HasSecretKey = false
+    @Published var s3State: S3SyncState = .idle
+    @Published var s3AutomaticEnabled = false
+    @Published var s3IntervalMinutes = 30
+
     private let sceneController = PreferencesSceneController()
     private var pendingDeferredRender = false
 
@@ -712,6 +762,13 @@ private final class PreferencesSwiftUIViewModel: ObservableObject {
     var onAutomaticUpdateChecksChanged: ((Bool) -> Void)?
     var onAppearanceModeChanged: (() -> Void)?
     var onBackupRequested: ((URL, Bool) async -> Result<RustBackupResult, RustCoreError>?)?
+
+    var s3SettingsStore: S3SettingsStore?
+    var onS3Upload: (() -> Void)?
+    var onS3Download: (() -> Void)?
+    var onS3Synchronize: (() -> Void)?
+    var onS3Cancel: (() -> Void)?
+    var onS3ConfigurationChanged: (() -> Void)?
 
     func chooseBackup(importing: Bool) {
         guard !isTransferringBackup else { return }
@@ -774,6 +831,89 @@ private final class PreferencesSwiftUIViewModel: ObservableObject {
     func selectSection(_ section: PreferenceSection) {
         apply(sceneController.selectSection(sceneSection(for: section)))
     }
+
+    // MARK: - S3 同步操作
+
+    func loadS3Settings() {
+        guard let store = s3SettingsStore else { return }
+        s3Configuration = store.configuration
+        s3HasSecretKey = store.hasSecretAccessKey
+        s3AutomaticEnabled = store.isAutomaticSyncEnabled
+        s3IntervalMinutes = store.automaticSyncIntervalMinutes
+    }
+
+    func saveS3Configuration() {
+        s3SettingsStore?.configuration = s3Configuration
+        onS3ConfigurationChanged?()
+    }
+
+    func setS3SecretKey(_ value: String) {
+        guard let store = s3SettingsStore else { return }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        store.setSecretAccessKey(trimmed)
+        s3HasSecretKey = store.hasSecretAccessKey
+        onS3ConfigurationChanged?()
+    }
+
+    func clearS3SecretKey() {
+        s3SettingsStore?.setSecretAccessKey("")
+        s3HasSecretKey = false
+        onS3ConfigurationChanged?()
+    }
+
+    func setS3AutomaticEnabled(_ enabled: Bool) {
+        s3AutomaticEnabled = enabled
+        s3SettingsStore?.isAutomaticSyncEnabled = enabled
+        onS3ConfigurationChanged?()
+    }
+
+    func setS3IntervalMinutes(_ minutes: Int) {
+        s3IntervalMinutes = minutes
+        s3SettingsStore?.automaticSyncIntervalMinutes = minutes
+        onS3ConfigurationChanged?()
+    }
+
+    var s3StatusText: String {
+        switch s3State {
+        case .idle:
+            if let last = s3SettingsStore?.lastSyncDate {
+                return AppLocalization.format(
+                    "s3.status.lastSync",
+                    defaultValue: "上次同步：%@",
+                    Self.syncDateFormatter.string(from: last)
+                )
+            }
+            return AppLocalization.text("s3.status.notConfigured", defaultValue: "尚未同步")
+        case .uploading:
+            return AppLocalization.text("s3.status.uploading", defaultValue: "正在上传…")
+        case .downloading:
+            return AppLocalization.text("s3.status.downloading", defaultValue: "正在下载…")
+        case .succeeded(let outcome):
+            return outcome.summary
+        case .failed(let message):
+            return AppLocalization.format("s3.status.failed", defaultValue: "同步失败：%@", message)
+        }
+    }
+
+    var s3StatusIsError: Bool {
+        if case .failed = s3State { return true }
+        return false
+    }
+
+    var s3IsBusy: Bool {
+        switch s3State {
+        case .uploading, .downloading: return true
+        default: return false
+        }
+    }
+
+    private static let syncDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .short
+        formatter.timeStyle = .short
+        return formatter
+    }()
 
     func updatePreferences(_ preferences: RustPreferencesDocument) {
         apply(sceneController.updatePreferences(preferences))
@@ -918,6 +1058,8 @@ private final class PreferencesSwiftUIViewModel: ObservableObject {
             return .shortcuts
         case .rules:
             return .rules
+        case .sync:
+            return .general
         case .about:
             return .about
         }
@@ -1537,6 +1679,8 @@ private struct PreferencePageHost: View {
             PreferenceShortcutSection(model: model)
         case .rules:
             PreferencePrivacySection(model: model)
+        case .sync:
+            PreferenceS3SyncSection(model: model)
         case .about:
             PreferenceAboutSection(model: model)
         }
@@ -1924,6 +2068,214 @@ private struct PreferenceShortcutSection: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.regular)
+            }
+        }
+    }
+}
+
+private struct PreferenceS3SyncSection: View {
+    @ObservedObject var model: PreferencesSwiftUIViewModel
+    @Environment(\.colorScheme) private var colorScheme
+
+    @State private var secretKeyInput = ""
+    @State private var showSecretField = false
+
+    private var colors: PreferencesThemeValues {
+        PreferencesThemeValues(colorScheme: colorScheme)
+    }
+
+    private var canRunActions: Bool {
+        model.s3Configuration.isComplete && model.s3HasSecretKey && !model.s3IsBusy
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            PreferenceSectionGroup(title: AppLocalization.text("s3.group.connection", defaultValue: "S3 连接")) {
+                PreferenceStackedRow(
+                    title: AppLocalization.text("s3.endpoint.title", defaultValue: "Endpoint"),
+                    detail: AppLocalization.text("s3.endpoint.detail", defaultValue: "例如 https://s3.us-east-1.amazonaws.com 或 MinIO / R2 地址")
+                ) {
+                    PreferenceTextInputField(
+                        value: model.s3Configuration.endpoint,
+                        placeholder: "https://s3.example.com",
+                        width: nil
+                    ) { value in
+                        model.s3Configuration.endpoint = value
+                        model.saveS3Configuration()
+                    }
+                }
+                PreferenceDivider()
+                PreferenceStackedRow(
+                    title: AppLocalization.text("s3.region.title", defaultValue: "区域"),
+                    detail: AppLocalization.text("s3.region.detail", defaultValue: "签名与请求使用的 Region，不知道时填 us-east-1")
+                ) {
+                    PreferenceTextInputField(
+                        value: model.s3Configuration.region,
+                        placeholder: "us-east-1",
+                        width: nil
+                    ) { value in
+                        model.s3Configuration.region = value.isEmpty ? "us-east-1" : value
+                        model.saveS3Configuration()
+                    }
+                }
+                PreferenceDivider()
+                PreferenceStackedRow(
+                    title: AppLocalization.text("s3.bucket.title", defaultValue: "Bucket"),
+                    detail: AppLocalization.text("s3.bucket.detail", defaultValue: "用于存放同步快照的存储桶名称")
+                ) {
+                    PreferenceTextInputField(
+                        value: model.s3Configuration.bucket,
+                        placeholder: "clipdock-sync",
+                        width: nil
+                    ) { value in
+                        model.s3Configuration.bucket = value
+                        model.saveS3Configuration()
+                    }
+                }
+                PreferenceDivider()
+                PreferenceStackedRow(
+                    title: AppLocalization.text("s3.objectKey.title", defaultValue: "对象路径"),
+                    detail: AppLocalization.text("s3.objectKey.detail", defaultValue: "远端保存同步快照的对象 key，保持默认即可")
+                ) {
+                    PreferenceTextInputField(
+                        value: model.s3Configuration.objectKey,
+                        placeholder: S3SyncConfiguration.defaultObjectKey,
+                        width: nil
+                    ) { value in
+                        model.s3Configuration.objectKey = value.isEmpty
+                            ? S3SyncConfiguration.defaultObjectKey
+                            : value
+                        model.saveS3Configuration()
+                    }
+                }
+            }
+
+            PreferenceSectionGroup(title: AppLocalization.text("s3.group.credentials", defaultValue: "访问凭据")) {
+                PreferenceStackedRow(
+                    title: AppLocalization.text("s3.accessKey.title", defaultValue: "Access Key ID"),
+                    detail: AppLocalization.text("s3.accessKey.detail", defaultValue: "建议为该桶单独创建仅具备读写权限的密钥")
+                ) {
+                    PreferenceTextInputField(
+                        value: model.s3Configuration.accessKeyID,
+                        placeholder: "AKIA…",
+                        width: nil
+                    ) { value in
+                        model.s3Configuration.accessKeyID = value
+                        model.saveS3Configuration()
+                    }
+                }
+                PreferenceDivider()
+                PreferenceStackedRow(
+                    title: AppLocalization.text("s3.secretKey.title", defaultValue: "Secret Access Key"),
+                    detail: model.s3HasSecretKey
+                        ? AppLocalization.text("s3.secretKey.saved", defaultValue: "已保存在系统钥匙串中；重新填写可覆盖")
+                        : AppLocalization.text("s3.secretKey.missing", defaultValue: "尚未填写，密钥将保存在系统钥匙串")
+                ) {
+                    HStack(spacing: 10) {
+                        if model.s3HasSecretKey && !showSecretField {
+                            Button(AppLocalization.text("s3.secretKey.replace", defaultValue: "更换密钥")) {
+                                showSecretField = true
+                            }
+                            Button(AppLocalization.text("s3.secretKey.clear", defaultValue: "清除")) {
+                                model.clearS3SecretKey()
+                                showSecretField = false
+                            }
+                        } else {
+                            SecureField(
+                                AppLocalization.text("s3.secretKey.placeholder", defaultValue: "Secret Access Key"),
+                                text: $secretKeyInput
+                            )
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 13))
+                            Button(AppLocalization.text("s3.secretKey.save", defaultValue: "保存")) {
+                                model.setS3SecretKey(secretKeyInput)
+                                secretKeyInput = ""
+                                showSecretField = false
+                            }
+                            .disabled(secretKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        }
+                    }
+                }
+            }
+
+            PreferenceSectionGroup(title: AppLocalization.text("s3.group.actions", defaultValue: "同步")) {
+                PreferenceStackedRow(
+                    title: AppLocalization.text("s3.sync.title", defaultValue: "手动同步"),
+                    detail: AppLocalization.text("s3.sync.detail", defaultValue: "双向同步会先下载并合并远端记录，再上传合并后的整库；上传会覆盖远端快照")
+                ) {
+                    HStack(spacing: 10) {
+                        Button(AppLocalization.text("s3.action.sync", defaultValue: "立即同步")) {
+                            model.onS3Synchronize?()
+                        }
+                        Button(AppLocalization.text("s3.action.download", defaultValue: "仅下载")) {
+                            model.onS3Download?()
+                        }
+                        Button(AppLocalization.text("s3.action.upload", defaultValue: "仅上传")) {
+                            model.onS3Upload?()
+                        }
+                        if model.s3IsBusy {
+                            Button(AppLocalization.text("s3.action.cancel", defaultValue: "取消")) {
+                                model.onS3Cancel?()
+                            }
+                        }
+                    }
+                    .disabled(!canRunActions && !model.s3IsBusy)
+                }
+                PreferenceDivider()
+                PreferenceRow(
+                    title: AppLocalization.text("s3.status.title", defaultValue: "同步状态"),
+                    detail: AppLocalization.text("s3.status.detail", defaultValue: "显示最近一次同步结果")
+                ) {
+                    Text(model.s3StatusText)
+                        .font(.system(size: 12))
+                        .foregroundStyle(model.s3StatusIsError ? Color.red : colors.secondaryText)
+                        .multilineTextAlignment(.trailing)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            PreferenceSectionGroup(title: AppLocalization.text("s3.group.schedule", defaultValue: "定时同步")) {
+                PreferenceRow(
+                    title: AppLocalization.text("s3.auto.title", defaultValue: "自动同步"),
+                    detail: AppLocalization.text("s3.auto.detail", defaultValue: "按固定间隔在后台执行一次双向同步")
+                ) {
+                    Toggle(
+                        "",
+                        isOn: Binding(
+                            get: { model.s3AutomaticEnabled },
+                            set: { model.setS3AutomaticEnabled($0) }
+                        )
+                    )
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .disabled(!model.s3Configuration.isComplete || !model.s3HasSecretKey)
+                }
+                PreferenceDivider()
+                PreferenceRow(
+                    title: AppLocalization.text("s3.interval.title", defaultValue: "同步间隔"),
+                    detail: AppLocalization.text("s3.interval.detail", defaultValue: "自动同步的执行频率")
+                ) {
+                    HStack(spacing: 8) {
+                        Picker(
+                            "",
+                            selection: Binding(
+                                get: { model.s3IntervalMinutes },
+                                set: { model.setS3IntervalMinutes($0) }
+                            )
+                        ) {
+                            Text(AppLocalization.text("s3.interval.5", defaultValue: "5 分钟")).tag(5)
+                            Text(AppLocalization.text("s3.interval.15", defaultValue: "15 分钟")).tag(15)
+                            Text(AppLocalization.text("s3.interval.30", defaultValue: "30 分钟")).tag(30)
+                            Text(AppLocalization.text("s3.interval.60", defaultValue: "1 小时")).tag(60)
+                            Text(AppLocalization.text("s3.interval.180", defaultValue: "3 小时")).tag(180)
+                            Text(AppLocalization.text("s3.interval.720", defaultValue: "12 小时")).tag(720)
+                        }
+                        .labelsHidden()
+                        .frame(width: 140)
+                        .disabled(!model.s3AutomaticEnabled)
+                    }
+                }
             }
         }
     }
@@ -3386,6 +3738,21 @@ private final class LegacyPreferencesWindowController: NSWindowController {
                     ])
                 ]
             )
+        case .sync:
+            // S3 同步使用 SwiftUI 页面实现，旧版 AppKit 页面不重复提供。
+            return makeContentPage(
+                title: section.title,
+                subtitle: section.subtitle,
+                sections: [
+                    makeSection(title: nil, rows: [
+                        makeSettingRow(
+                            title: AppLocalization.text("s3.legacy.unavailable", defaultValue: "请在当前设置界面中配置 S3 同步"),
+                            detail: "",
+                            control: makeShortcutPill("")
+                        )
+                    ])
+                ]
+            )
         case .about:
             return makeContentPage(
                 title: section.title,
@@ -3779,6 +4146,8 @@ private final class LegacyPreferencesWindowController: NSWindowController {
             return .shortcuts
         case .rules:
             return .rules
+        case .sync:
+            return .general
         case .about:
             return .about
         }

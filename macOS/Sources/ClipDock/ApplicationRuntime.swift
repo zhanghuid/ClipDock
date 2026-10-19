@@ -127,6 +127,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let updateCoordinator = AppUpdateCoordinator()
     private let commandVKeystrokeSender: CommandVKeystrokeSending = SystemCommandVKeystrokeSender()
     private let databaseWorker = ClipboardCoreDatabaseWorker()
+    private let s3SettingsStore = S3SettingsStore()
+    private var s3SyncCoordinator: S3SyncCoordinator?
     private let captureRegistrationPipeline = ClipboardCaptureRegistrationPipeline()
     private let imageCaptureSessionID = UUID().uuidString
     private var statusItem: NSStatusItem?
@@ -205,6 +207,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             await linkMetadataCoordinator?.stop()
         }
         updateCoordinator.stop()
+        s3SyncCoordinator?.stopAutomaticSync()
         clipboardMonitor.stop()
         sourceApplicationTracker.stop()
         unregisterGlobalHotKey()
@@ -619,6 +622,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return "self-copy-\(token)"
     }
 
+    /// 接线 S3 同步：设置界面负责配置与触发，协调器负责导出/上传/下载/导入。
+    private func configureS3Sync() {
+        preferencesController.s3SettingsStore = s3SettingsStore
+
+        let coordinator = S3SyncCoordinator(
+            settings: s3SettingsStore,
+            databaseWorker: databaseWorker,
+            rustCoreClient: rustCoreClient,
+            appSupportDirectory: { [weak self] in self?.appSupportURL }
+        )
+        coordinator.onStateChange = { [weak self] state in
+            self?.preferencesController.updateS3State(state)
+        }
+        coordinator.onDataImported = { [weak self] in
+            guard let self else { return }
+            self.refreshPinboards()
+            self.listCoordinator?.refresh()
+        }
+        s3SyncCoordinator = coordinator
+
+        preferencesController.onS3Upload = { [weak coordinator] in coordinator?.upload() }
+        preferencesController.onS3Download = { [weak coordinator] in coordinator?.download() }
+        preferencesController.onS3Synchronize = { [weak coordinator] in coordinator?.synchronize() }
+        preferencesController.onS3Cancel = { [weak coordinator] in coordinator?.cancel() }
+        preferencesController.onS3ConfigurationChanged = { [weak coordinator] in
+            coordinator?.refreshAutomaticSync()
+        }
+        coordinator.refreshAutomaticSync()
+    }
+
     private func configurePanelCallbacks() {
         panelController.onRuntimeAction = { [weak self] action in
             switch action {
@@ -683,6 +716,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return result
         }
+        configureS3Sync()
         preferencesController.onAccessibilityPermissionRequested = { [weak self] in
             self?.openAccessibilitySettingsFromPreferences()
         }
