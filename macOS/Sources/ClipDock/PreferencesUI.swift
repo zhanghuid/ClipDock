@@ -1059,7 +1059,7 @@ private final class PreferencesSwiftUIViewModel: ObservableObject {
         case .rules:
             return .rules
         case .sync:
-            return .general
+            return .sync
         case .about:
             return .about
         }
@@ -1077,6 +1077,8 @@ private final class PreferencesSwiftUIViewModel: ObservableObject {
             return .shortcuts
         case .rules:
             return .rules
+        case .sync:
+            return .sync
         case .about:
             return .about
         }
@@ -4147,7 +4149,7 @@ private final class LegacyPreferencesWindowController: NSWindowController {
         case .rules:
             return .rules
         case .sync:
-            return .general
+            return .sync
         case .about:
             return .about
         }
@@ -4165,6 +4167,8 @@ private final class LegacyPreferencesWindowController: NSWindowController {
             return .shortcuts
         case .rules:
             return .rules
+        case .sync:
+            return .sync
         case .about:
             return .about
         }

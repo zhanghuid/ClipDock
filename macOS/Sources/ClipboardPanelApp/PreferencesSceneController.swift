@@ -6,6 +6,7 @@ public enum PreferencesSceneSection: String, CaseIterable, Equatable, Sendable {
     case history
     case shortcuts
     case rules
+    case sync
     case about
 
     public static var allCases: [PreferencesSceneSection] {
