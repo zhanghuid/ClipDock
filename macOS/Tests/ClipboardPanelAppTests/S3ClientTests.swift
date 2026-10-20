@@ -64,6 +64,22 @@ struct S3ClientTests {
         #expect(S3SyncConfiguration().objectKey == "clipdock/library.clipdock")
     }
 
+    @Test
+    func missingFieldNamesReportEveryRequiredField() {
+        var configuration = S3SyncConfiguration()
+        #expect(configuration.missingFieldNames == ["Endpoint", "Bucket", "Access Key ID"])
+
+        configuration.endpoint = "https://s3.example.com"
+        #expect(configuration.missingFieldNames == ["Bucket", "Access Key ID"])
+
+        configuration.bucket = "clipdock"
+        #expect(configuration.missingFieldNames == ["Access Key ID"])
+
+        configuration.accessKeyID = "AKIAEXAMPLE"
+        #expect(configuration.missingFieldNames.isEmpty)
+        #expect(configuration.isComplete)
+    }
+
     private static func derive(secret: String, dateStamp: String, region: String) -> Data {
         S3Client.signingKeyValue(secretAccessKey: secret, dateStamp: dateStamp, region: region)
     }

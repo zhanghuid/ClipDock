@@ -749,6 +749,7 @@ private final class PreferencesSwiftUIViewModel: ObservableObject {
 
     @Published var s3Configuration = S3SyncConfiguration()
     @Published private(set) var s3HasSecretKey = false
+    @Published private(set) var s3SecretKeyError: String?
     @Published var s3State: S3SyncState = .idle
     @Published var s3AutomaticEnabled = false
     @Published var s3IntervalMinutes = 30
@@ -864,14 +865,21 @@ private final class PreferencesSwiftUIViewModel: ObservableObject {
         guard let store = s3SettingsStore else { return }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        store.setSecretAccessKey(trimmed)
+        let saved = store.setSecretAccessKey(trimmed)
         s3HasSecretKey = store.hasSecretAccessKey
+        s3SecretKeyError = (saved && s3HasSecretKey)
+            ? nil
+            : AppLocalization.text(
+                "s3.secretKey.saveFailed",
+                defaultValue: "无法写入系统钥匙串，请检查钥匙串访问权限后重试"
+            )
         onS3ConfigurationChanged?()
     }
 
     func clearS3SecretKey() {
         s3SettingsStore?.setSecretAccessKey("")
         s3HasSecretKey = false
+        s3SecretKeyError = nil
         onS3ConfigurationChanged?()
     }
 
@@ -919,6 +927,24 @@ private final class PreferencesSwiftUIViewModel: ObservableObject {
         case .uploading, .downloading: return true
         default: return false
         }
+    }
+
+    var s3IsConfigured: Bool {
+        s3Configuration.isComplete && s3HasSecretKey
+    }
+
+    /// 配置不完整时说明缺少哪些字段，避免按钮变灰却没有任何解释。
+    var s3MissingConfigurationDescription: String? {
+        var missing = s3Configuration.missingFieldNames
+        if !s3HasSecretKey {
+            missing.append("Secret Access Key")
+        }
+        guard !missing.isEmpty else { return nil }
+        return AppLocalization.format(
+            "s3.config.missing",
+            defaultValue: "还需填写：%@",
+            missing.joined(separator: "、")
+        )
     }
 
     private static let syncDateFormatter: DateFormatter = {
@@ -2104,19 +2130,23 @@ private struct PreferenceS3SyncSection: View {
     }
 
     private var canRunActions: Bool {
-        model.s3Configuration.isComplete && model.s3HasSecretKey && !model.s3IsBusy
+        model.s3IsConfigured && !model.s3IsBusy
+    }
+
+    private var disabledReason: String? {
+        model.s3MissingConfigurationDescription
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             PreferenceSectionGroup(title: AppLocalization.text("s3.group.connection", defaultValue: "S3 连接")) {
                 PreferenceStackedRow(
-                    title: AppLocalization.text("s3.endpoint.title", defaultValue: "Endpoint"),
+                    title: AppLocalization.text("s3.endpoint.title", defaultValue: "Endpoint（必填）"),
                     detail: AppLocalization.text("s3.endpoint.detail", defaultValue: "例如 https://s3.us-east-1.amazonaws.com 或 MinIO / R2 地址")
                 ) {
                     PreferenceTextInputField(
                         value: model.s3Configuration.endpoint,
-                        placeholder: "https://s3.example.com",
+                        placeholder: "例如 https://s3.example.com",
                         width: nil
                     ) { value in
                         model.s3Configuration.endpoint = value
@@ -2139,12 +2169,12 @@ private struct PreferenceS3SyncSection: View {
                 }
                 PreferenceDivider()
                 PreferenceStackedRow(
-                    title: AppLocalization.text("s3.bucket.title", defaultValue: "Bucket"),
+                    title: AppLocalization.text("s3.bucket.title", defaultValue: "Bucket（必填）"),
                     detail: AppLocalization.text("s3.bucket.detail", defaultValue: "用于存放同步快照的存储桶名称")
                 ) {
                     PreferenceTextInputField(
                         value: model.s3Configuration.bucket,
-                        placeholder: "clipdock-sync",
+                        placeholder: "例如 clipdock-sync",
                         width: nil
                     ) { value in
                         model.s3Configuration.bucket = value
@@ -2171,7 +2201,7 @@ private struct PreferenceS3SyncSection: View {
 
             PreferenceSectionGroup(title: AppLocalization.text("s3.group.credentials", defaultValue: "访问凭据")) {
                 PreferenceStackedRow(
-                    title: AppLocalization.text("s3.accessKey.title", defaultValue: "Access Key ID"),
+                    title: AppLocalization.text("s3.accessKey.title", defaultValue: "Access Key ID（必填）"),
                     detail: AppLocalization.text("s3.accessKey.detail", defaultValue: "建议为该桶单独创建仅具备读写权限的密钥")
                 ) {
                     PreferenceTextInputField(
@@ -2185,7 +2215,7 @@ private struct PreferenceS3SyncSection: View {
                 }
                 PreferenceDivider()
                 PreferenceStackedRow(
-                    title: AppLocalization.text("s3.secretKey.title", defaultValue: "Secret Access Key"),
+                    title: AppLocalization.text("s3.secretKey.title", defaultValue: "Secret Access Key（必填）"),
                     detail: model.s3HasSecretKey
                         ? AppLocalization.text("s3.secretKey.saved", defaultValue: "已保存在系统钥匙串中；重新填写可覆盖")
                         : AppLocalization.text("s3.secretKey.missing", defaultValue: "尚未填写，密钥将保存在系统钥匙串")
@@ -2215,6 +2245,10 @@ private struct PreferenceS3SyncSection: View {
                         }
                     }
                 }
+                if let error = model.s3SecretKeyError {
+                    PreferenceDivider()
+                    S3NoticeText(text: error, isError: true)
+                }
             }
 
             PreferenceSectionGroup(title: AppLocalization.text("s3.group.actions", defaultValue: "同步")) {
@@ -2239,6 +2273,11 @@ private struct PreferenceS3SyncSection: View {
                         }
                     }
                     .disabled(!canRunActions && !model.s3IsBusy)
+                    .help(disabledReason ?? "")
+                }
+                if let disabledReason, !model.s3IsBusy {
+                    PreferenceDivider()
+                    S3NoticeText(text: disabledReason, isError: false)
                 }
                 PreferenceDivider()
                 PreferenceRow(
@@ -2256,7 +2295,9 @@ private struct PreferenceS3SyncSection: View {
             PreferenceSectionGroup(title: AppLocalization.text("s3.group.schedule", defaultValue: "定时同步")) {
                 PreferenceRow(
                     title: AppLocalization.text("s3.auto.title", defaultValue: "自动同步"),
-                    detail: AppLocalization.text("s3.auto.detail", defaultValue: "按固定间隔在后台执行一次双向同步")
+                    detail: model.s3IsConfigured
+                        ? AppLocalization.text("s3.auto.detail", defaultValue: "按固定间隔在后台执行一次双向同步")
+                        : (disabledReason ?? AppLocalization.text("s3.auto.detail", defaultValue: "按固定间隔在后台执行一次双向同步"))
                 ) {
                     Toggle(
                         "",
@@ -2268,7 +2309,8 @@ private struct PreferenceS3SyncSection: View {
                     .labelsHidden()
                     .toggleStyle(.switch)
                     .controlSize(.small)
-                    .disabled(!model.s3Configuration.isComplete || !model.s3HasSecretKey)
+                    .disabled(!model.s3IsConfigured)
+                    .help(disabledReason ?? "")
                 }
                 PreferenceDivider()
                 PreferenceRow(
@@ -2293,10 +2335,34 @@ private struct PreferenceS3SyncSection: View {
                         .labelsHidden()
                         .frame(width: 140)
                         .disabled(!model.s3AutomaticEnabled)
+                        .help(model.s3AutomaticEnabled ? "" : AppLocalization.text(
+                            "s3.interval.enableAutoFirst",
+                            defaultValue: "请先开启自动同步"
+                        ))
                     }
                 }
             }
         }
+    }
+}
+
+/// 设置卡片内的提示行，用于说明按钮为何不可用或凭据保存失败。
+private struct S3NoticeText: View {
+    let text: String
+    let isError: Bool
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: isError ? "exclamationmark.triangle.fill" : "info.circle")
+                .font(.system(size: 12, weight: .semibold))
+            Text(text)
+                .font(.system(size: 12.5))
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .foregroundStyle(isError ? Color.red : Color.orange)
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
     }
 }
 

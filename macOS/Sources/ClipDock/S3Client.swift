@@ -29,9 +29,22 @@ struct S3SyncConfiguration: Equatable, Sendable {
     }
 
     var isComplete: Bool {
-        !normalizedEndpoint.isEmpty
-            && !bucket.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && !accessKeyID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        missingFieldNames.isEmpty
+    }
+
+    /// 还缺少哪些必填字段，用于界面提示（密钥单独由钥匙串判断）。
+    var missingFieldNames: [String] {
+        var missing: [String] = []
+        if normalizedEndpoint.isEmpty {
+            missing.append("Endpoint")
+        }
+        if bucket.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            missing.append("Bucket")
+        }
+        if accessKeyID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            missing.append("Access Key ID")
+        }
+        return missing
     }
 
     var normalizedEndpoint: String {
