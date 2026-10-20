@@ -724,7 +724,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.updateCoordinator.checkForSettingsUpdate()
         }
         preferencesController.onUpdateReleaseRequested = { [weak self] release in
+            self?.updateCoordinator.installUpdate(release)
+        }
+        preferencesController.onUpdateReleasePageRequested = { [weak self] release in
             self?.updateCoordinator.openReleasePage(release)
+        }
+        preferencesController.onManualUpdateCheckRequested = { [weak self] in
+            guard let self else { return }
+            // 手动检查不受「自动检查」开关限制。
+            Task { @MainActor [weak self] in
+                await self?.updateCoordinator.checkManually()
+                self?.preferencesController.finishManualUpdateCheck()
+            }
+        }
+        updateCoordinator.onInstallStateChanged = { [weak self] state in
+            self?.preferencesController.updateInstallState(state)
         }
         preferencesController.onAutomaticUpdateChecksChanged = { [weak self] isEnabled in
             self?.updateCoordinator.setAutomaticChecksEnabled(isEnabled)

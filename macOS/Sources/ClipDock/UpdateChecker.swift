@@ -9,6 +9,8 @@ struct AppUpdateRelease: Equatable, Sendable {
     let downloadURL: URL
     let releaseNotes: String?
     let publishedAt: Date?
+    /// 发布资产提供的 SHA-256（来自 `SHA256SUMS`），安装前用于校验。
+    let dmgSHA256: String?
 
     init(
         version: String,
@@ -16,7 +18,8 @@ struct AppUpdateRelease: Equatable, Sendable {
         releaseURL: URL,
         downloadURL: URL,
         releaseNotes: String? = nil,
-        publishedAt: Date? = nil
+        publishedAt: Date? = nil,
+        dmgSHA256: String? = nil
     ) {
         self.version = version
         self.displayVersion = AppReleaseVersion.displayString(from: version)
@@ -25,6 +28,7 @@ struct AppUpdateRelease: Equatable, Sendable {
         self.downloadURL = downloadURL
         self.releaseNotes = releaseNotes
         self.publishedAt = publishedAt
+        self.dmgSHA256 = dmgSHA256
     }
 }
 
@@ -205,13 +209,17 @@ struct GitHubAppUpdateProvider: AppUpdateProviding {
         }
     }
 
+    /// 发行版仓库。应用内热更需要从这里取 DMG，必须指向有发布产物的仓库。
+    static let repositoryOwner = "zhanghuid"
+    static let repositoryName = "ClipDock"
+
     let endpointURL: URL
     let latestPageURL: URL
     let session: URLSession
 
     init(
-        endpointURL: URL = URL(string: "https://api.github.com/repos/appdev/ClipDock/releases/latest")!,
-        latestPageURL: URL = URL(string: "https://github.com/appdev/ClipDock/releases/latest")!,
+        endpointURL: URL = URL(string: "https://api.github.com/repos/zhanghuid/ClipDock/releases/latest")!,
+        latestPageURL: URL = URL(string: "https://github.com/zhanghuid/ClipDock/releases/latest")!,
         session: URLSession = .shared
     ) {
         self.endpointURL = endpointURL
@@ -265,14 +273,65 @@ struct GitHubAppUpdateProvider: AppUpdateProviding {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         let release = try decoder.decode(ReleaseResponse.self, from: data)
+        let dmg = Self.preferredDMGAsset(from: release.assets)
+        var checksum: String?
+        if let dmg {
+            checksum = await Self.checksum(for: dmg.name, from: release.assets)
+        }
         return AppUpdateRelease(
             version: release.tagName,
             releaseName: release.name,
             releaseURL: release.htmlURL,
-            downloadURL: Self.preferredDownloadURL(from: release.assets, fallback: release.htmlURL),
+            downloadURL: dmg?.browserDownloadURL
+                ?? Self.preferredDownloadURL(from: release.assets, fallback: release.htmlURL),
             releaseNotes: release.body,
-            publishedAt: release.publishedAt
+            publishedAt: release.publishedAt,
+            dmgSHA256: checksum
         )
+    }
+
+    /// 优先匹配当前 CPU 架构的 DMG；发行包里同时有 arm64 与 x86_64。
+    private static func preferredDMGAsset(from assets: [ReleaseAsset]) -> ReleaseAsset? {
+        let dmgAssets = assets.filter { $0.name.lowercased().hasSuffix(".dmg") }
+        guard !dmgAssets.isEmpty else { return nil }
+        #if arch(arm64)
+        let preferredSuffix = "arm64"
+        #else
+        let preferredSuffix = "x86_64"
+        #endif
+        return dmgAssets.first { $0.name.lowercased().contains(preferredSuffix) } ?? dmgAssets[0]
+    }
+
+    /// 从发布的 `SHA256SUMS` 里取对应 DMG 的摘要；取不到就返回 nil（安装时跳过校验）。
+    private static func checksum(for assetName: String, from assets: [ReleaseAsset]) async -> String? {
+        guard let manifest = assets.first(where: {
+            $0.name.uppercased().hasPrefix("SHA256SUMS")
+        }) else {
+            return nil
+        }
+
+        var request = URLRequest(url: manifest.browserDownloadURL)
+        request.timeoutInterval = 15
+        request.setValue("ClipDock Updater", forHTTPHeaderField: "User-Agent")
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode),
+              let text = String(data: data, encoding: .utf8)
+        else {
+            return nil
+        }
+
+        for line in text.split(separator: "\n") {
+            let parts = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).filter { !$0.isEmpty }
+            guard parts.count >= 2 else { continue }
+            let digest = String(parts[0])
+            let path = parts.dropFirst().joined(separator: " ")
+            // 清单里记录的是 `arm64/ClipDock.app/...` 之类的相对路径，按文件名匹配即可。
+            if path.hasSuffix(assetName), digest.count == 64 {
+                return digest
+            }
+        }
+        return nil
     }
 
     nonisolated static func releaseFromLatestPageURL(_ releaseURL: URL) -> AppUpdateRelease? {
@@ -432,6 +491,19 @@ enum AppUpdateSettingsStatus: Equatable {
     case available(AppUpdateRelease)
 }
 
+/// 应用内安装的界面状态。
+enum AppUpdateInstallState: Equatable {
+    case idle
+    case downloading(AppUpdateInstaller.Progress?)
+    case installed
+    case failed(String)
+
+    var isBusy: Bool {
+        if case .downloading = self { return true }
+        return false
+    }
+}
+
 @MainActor
 protocol AppUpdatePromptPresenting: AnyObject {
     func presentUpdatePrompt(
@@ -462,6 +534,10 @@ final class AppUpdateCoordinator {
     private let versionProvider: any AppVersionProviding
     private let calendar: Calendar
     private let now: () -> Date
+    private let installer: any AppUpdateInstalling
+    private var installTask: Task<Void, Never>?
+    private var installState: AppUpdateInstallState = .idle
+    private var isInstalling = false
     private var timer: Timer?
     private var checkTask: Task<Void, Never>?
     private var settingsCheckTask: Task<Void, Never>?
@@ -470,6 +546,9 @@ final class AppUpdateCoordinator {
     private var isUpdatePromptPending = false
 
     var onSettingsUpdateStatusChanged: ((AppUpdateSettingsStatus) -> Void)?
+    var onInstallStateChanged: ((AppUpdateInstallState) -> Void)?
+    /// 测试可替换重启行为；生产环境走 `AppRelauncher`。
+    var relaunchAfterInstall: (() -> Void)?
 
     var automaticChecksEnabled: Bool {
         stateStore.automaticChecksEnabled
@@ -482,7 +561,8 @@ final class AppUpdateCoordinator {
         stateStore: any AppUpdateStateStoring = UserDefaultsAppUpdateStateStore(),
         versionProvider: any AppVersionProviding = BundleAppVersionProvider(),
         calendar: Calendar = .autoupdatingCurrent,
-        now: @escaping () -> Date = Date.init
+        now: @escaping () -> Date = Date.init,
+        installer: any AppUpdateInstalling = AppUpdateInstaller()
     ) {
         self.provider = provider
         self.promptPresenter = promptPresenter
@@ -491,6 +571,7 @@ final class AppUpdateCoordinator {
         self.versionProvider = versionProvider
         self.calendar = calendar
         self.now = now
+        self.installer = installer
     }
 
     func start() {
@@ -507,6 +588,9 @@ final class AppUpdateCoordinator {
         checkTask = nil
         settingsCheckTask?.cancel()
         settingsCheckTask = nil
+        installTask?.cancel()
+        installTask = nil
+        isInstalling = false
         isUpdatePromptPending = false
     }
 
@@ -540,6 +624,13 @@ final class AppUpdateCoordinator {
         }
     }
 
+    /// 手动检查：忽略「自动检查」开关，也不写 lastCheckAttemptDate。
+    func checkManually() async {
+        settingsCheckTask?.cancel()
+        onSettingsUpdateStatusChanged?(.checking)
+        await checkForSettingsUpdateNow()
+    }
+
     func checkForSettingsUpdateNow() async {
         do {
             let currentVersion = versionProvider.currentShortVersion()
@@ -563,6 +654,62 @@ final class AppUpdateCoordinator {
 
     func openReleasePage(_ release: AppUpdateRelease) {
         urlOpener.open(release.releaseURL)
+    }
+
+    /// 应用内热更：下载 → 校验 → 替换 → 重启。
+    /// 失败时通过 `onInstallStateChanged` 报错，不会让应用停在半安装状态。
+    func installUpdate(_ release: AppUpdateRelease) {
+        guard !isInstalling else { return }
+        isInstalling = true
+        publishInstallState(.downloading(nil))
+        // 从「关于」页触发时没有提示窗口，这里补一个，让进度可见。
+        let hasPrompt = (promptPresenter as? AppUpdatePromptWindowPresenter)?.hasActivePrompt ?? false
+        if !hasPrompt {
+            presentUpdatePromptIfNeeded(for: release)
+        }
+
+        installTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                self.isInstalling = false
+                self.installTask = nil
+            }
+            do {
+                try await self.installer.install(release: release) { progress in
+                    self.publishInstallState(.downloading(progress))
+                }
+                guard !Task.isCancelled else { return }
+                self.publishInstallState(.installed)
+                // 给界面一帧时间展示「安装完成」，再重启。
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                if let relaunchAfterInstall = self.relaunchAfterInstall {
+                    relaunchAfterInstall()
+                } else {
+                    AppRelauncher.relaunch()
+                }
+            } catch is CancellationError {
+                self.publishInstallState(.idle)
+            } catch {
+                self.publishInstallState(.failed(error.localizedDescription))
+            }
+        }
+    }
+
+    private func publishInstallState(_ state: AppUpdateInstallState) {
+        installState = state
+        onInstallStateChanged?(state)
+        (promptPresenter as? AppUpdatePromptWindowPresenter)?.updateInstallState(state)
+    }
+
+    var currentInstallState: AppUpdateInstallState {
+        installState
+    }
+
+    func cancelInstall() {
+        installTask?.cancel()
+        installTask = nil
+        isInstalling = false
+        publishInstallState(.idle)
     }
 
     func presentUpdatePrompt(for release: AppUpdateRelease) {
@@ -650,7 +797,12 @@ final class AppUpdateCoordinator {
     private func handlePromptAction(_ action: AppUpdatePromptAction, for release: AppUpdateRelease) {
         switch action {
         case .download:
-            urlOpener.open(release.downloadURL)
+            // 可热更时直接应用内安装；下载地址不是 DMG 时退回浏览器下载。
+            if release.downloadURL.pathExtension.lowercased() == "dmg" {
+                installUpdate(release)
+            } else {
+                urlOpener.open(release.downloadURL)
+            }
         case .skipForNow:
             break
         case .skipVersion:

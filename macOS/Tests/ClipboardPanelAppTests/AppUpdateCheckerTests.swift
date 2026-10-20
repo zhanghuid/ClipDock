@@ -161,7 +161,7 @@ struct AppUpdateCheckerTests {
             currentVersionText: "0.1.3 (3)"
         )
         #expect(available.detail.contains("0.2.0"))
-        #expect(available.detail.contains("发布页面"))
+        #expect(available.detail.contains("应用内更新"))
         #expect(available.value == "有更新 0.2.0")
         #expect(available.isActionable)
     }
@@ -282,6 +282,7 @@ struct AppUpdateCheckerTests {
         let promptPresenter = FakeAppUpdatePromptPresenter(action: nil)
         let urlOpener = FakeAppUpdateURLOpener()
         let stateStore = InMemoryAppUpdateStateStore()
+        let installer = FakeAppUpdateInstaller()
         let coordinator = AppUpdateCoordinator(
             provider: provider,
             promptPresenter: promptPresenter,
@@ -289,8 +290,10 @@ struct AppUpdateCheckerTests {
             stateStore: stateStore,
             versionProvider: FakeAppVersionProvider(version: "0.1.3"),
             calendar: fixedCalendar(),
-            now: { Date(timeIntervalSince1970: 1_779_282_000) }
+            now: { Date(timeIntervalSince1970: 1_779_282_000) },
+            installer: installer
         )
+        coordinator.relaunchAfterInstall = {}
         var statuses: [AppUpdateSettingsStatus] = []
         coordinator.onSettingsUpdateStatusChanged = { status in
             statuses.append(status)
@@ -315,7 +318,10 @@ struct AppUpdateCheckerTests {
 
         promptPresenter.completePendingAction(.download)
 
-        #expect(urlOpener.openedURLs == [release.downloadURL])
+        // 「安装更新」现在走应用内热更，不再打开浏览器。
+        await waitFor { installer.installedReleases.count == 1 }
+        #expect(installer.installedReleases == [release])
+        #expect(urlOpener.openedURLs.isEmpty)
     }
 
     @Test
@@ -338,6 +344,87 @@ struct AppUpdateCheckerTests {
         controller.smokeOpenVersionUpdateForQA()
 
         #expect(requestedRelease == release)
+    }
+
+    @Test
+    @MainActor
+    func installUpdatePublishesProgressAndCompletes() async throws {
+        let release = try makeRelease(version: "v0.2.0")
+        let installer = FakeAppUpdateInstaller()
+        let coordinator = AppUpdateCoordinator(
+            provider: FakeAppUpdateProvider(release: release),
+            promptPresenter: FakeAppUpdatePromptPresenter(),
+            urlOpener: FakeAppUpdateURLOpener(),
+            stateStore: InMemoryAppUpdateStateStore(),
+            versionProvider: FakeAppVersionProvider(version: "0.1.3"),
+            installer: installer
+        )
+        var relaunched = false
+        coordinator.relaunchAfterInstall = { relaunched = true }
+        var states: [AppUpdateInstallState] = []
+        coordinator.onInstallStateChanged = { states.append($0) }
+
+        coordinator.installUpdate(release)
+
+        await waitFor { relaunched }
+        #expect(installer.installedReleases == [release])
+        #expect(states.contains { if case .installed = $0 { return true } else { return false } })
+        #expect(states.contains { state in
+            if case .downloading(let progress) = state { return progress?.fraction == 0.5 }
+            return false
+        })
+    }
+
+    @Test
+    @MainActor
+    func installFailureIsReportedAndKeepsReleaseAvailable() async throws {
+        let release = try makeRelease(version: "v0.2.0")
+        let installer = FakeAppUpdateInstaller()
+        installer.error = AppUpdateInstaller.InstallError.verificationFailed("mismatch")
+        let coordinator = AppUpdateCoordinator(
+            provider: FakeAppUpdateProvider(release: release),
+            promptPresenter: FakeAppUpdatePromptPresenter(),
+            urlOpener: FakeAppUpdateURLOpener(),
+            stateStore: InMemoryAppUpdateStateStore(),
+            versionProvider: FakeAppVersionProvider(version: "0.1.3"),
+            installer: installer
+        )
+        var relaunched = false
+        coordinator.relaunchAfterInstall = { relaunched = true }
+        var failedMessage: String?
+        coordinator.onInstallStateChanged = { state in
+            if case .failed(let message) = state { failedMessage = message }
+        }
+
+        coordinator.installUpdate(release)
+        await waitFor { failedMessage != nil }
+
+        #expect(!relaunched)
+        #expect(failedMessage?.contains("校验") == true)
+        #expect(installer.installedReleases.isEmpty)
+    }
+
+    @Test
+    @MainActor
+    func installProgressIsReflectedInAboutPresentation() throws {
+        let release = try makeRelease(version: "v0.2.0")
+        let downloading = PreferencesVersionUpdatePresentation.make(
+            status: .available(release),
+            currentVersionText: "0.1.18 (17)",
+            installState: .downloading(AppUpdateInstaller.Progress(fraction: 0.42, statusText: "正在下载更新…"))
+        )
+        #expect(downloading.isInstalling)
+        #expect(downloading.installFraction == 0.42)
+        #expect(!downloading.isActionable)
+
+        let failed = PreferencesVersionUpdatePresentation.make(
+            status: .available(release),
+            currentVersionText: "0.1.18 (17)",
+            installState: .failed("SHA-256 不匹配")
+        )
+        #expect(failed.installFailed)
+        #expect(failed.isActionable)
+        #expect(failed.detail.contains("SHA-256"))
     }
 
     private func fixedCalendar() -> Calendar {
@@ -425,6 +512,20 @@ private final class FakeAppUpdatePromptPresenter: AppUpdatePromptPresenting {
 }
 
 @MainActor
+private final class FakeAppUpdateInstaller: AppUpdateInstalling {
+    private(set) var installedReleases: [AppUpdateRelease] = []
+    var error: Error?
+
+    func install(
+        release: AppUpdateRelease,
+        onProgress: @escaping (AppUpdateInstaller.Progress) -> Void
+    ) async throws {
+        onProgress(AppUpdateInstaller.Progress(fraction: 0.5, statusText: "下载中"))
+        if let error { throw error }
+        installedReleases.append(release)
+    }
+}
+
 private final class FakeAppUpdateURLOpener: AppUpdateURLOpening {
     private(set) var openedURLs: [URL] = []
 

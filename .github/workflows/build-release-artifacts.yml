@@ -166,6 +166,7 @@ jobs:
           path: |
             .codex/artifacts/release/${{ needs.metadata.outputs.version }}/macos/ClipDock-${{ needs.metadata.outputs.version }}-*.dmg
             .codex/artifacts/release/${{ needs.metadata.outputs.version }}/macos/ClipDock-release-manifest.txt
+            .codex/artifacts/release/${{ needs.metadata.outputs.version }}/macos/SHA256SUMS
           if-no-files-found: error
           retention-days: 30
 
@@ -442,8 +443,9 @@ jobs:
           fail_on_unmatched_files: true
           overwrite_files: true
           files: |
-            release-artifacts/**/*.dmg
+            release-artifacts/**/ClipDock-*.dmg
             release-artifacts/**/*release-manifest.txt
+            release-artifacts/**/SHA256SUMS
 
   publish-windows-release:
     name: Publish Windows GitHub Release

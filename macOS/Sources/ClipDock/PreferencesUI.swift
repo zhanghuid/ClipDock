@@ -518,6 +518,22 @@ final class PreferencesWindowController: NSWindowController {
         }
     }
 
+    var onUpdateReleasePageRequested: ((AppUpdateRelease) -> Void)? {
+        didSet { viewModel.onUpdateReleasePageRequested = onUpdateReleasePageRequested }
+    }
+
+    var onManualUpdateCheckRequested: (() -> Void)? {
+        didSet { viewModel.onManualUpdateCheckRequested = onManualUpdateCheckRequested }
+    }
+
+    func updateInstallState(_ state: AppUpdateInstallState) {
+        viewModel.updateInstallState(state)
+    }
+
+    func finishManualUpdateCheck() {
+        viewModel.finishManualUpdateCheck()
+    }
+
     var onAutomaticUpdateChecksChanged: ((Bool) -> Void)? {
         didSet {
             viewModel.onAutomaticUpdateChecksChanged = onAutomaticUpdateChecksChanged
@@ -741,6 +757,8 @@ private final class PreferencesToolbarCoordinator: NSObject, NSToolbarDelegate {
 private final class PreferencesSwiftUIViewModel: ObservableObject {
     @Published private(set) var state = PreferencesSceneState()
     @Published private(set) var updateStatus: AppUpdateSettingsStatus = .idle
+    @Published private(set) var installState: AppUpdateInstallState = .idle
+    @Published private(set) var isCheckingForUpdates = false
     @Published private(set) var automaticUpdateChecksEnabled = true
     @Published private(set) var isTransferringBackup = false
     @Published private(set) var backupStatus = ""
@@ -763,6 +781,8 @@ private final class PreferencesSwiftUIViewModel: ObservableObject {
     var onPreferencesChanged: ((RustPreferencesDocument) -> RustPreferencesDocument?)?
     var onAccessibilityPermissionRequested: (() -> Void)?
     var onUpdateReleaseRequested: ((AppUpdateRelease) -> Void)?
+    var onUpdateReleasePageRequested: ((AppUpdateRelease) -> Void)?
+    var onManualUpdateCheckRequested: (() -> Void)?
     var onAutomaticUpdateChecksChanged: ((Bool) -> Void)?
     var onAppearanceModeChanged: (() -> Void)?
     var onBackupRequested: ((URL, Bool) async -> Result<RustBackupResult, RustCoreError>?)?
@@ -1015,6 +1035,15 @@ private final class PreferencesSwiftUIViewModel: ObservableObject {
         updateStatus = status
     }
 
+    func updateInstallState(_ state: AppUpdateInstallState) {
+        installState = state
+        isCheckingForUpdates = false
+    }
+
+    func finishManualUpdateCheck() {
+        isCheckingForUpdates = false
+    }
+
     func updateAutomaticUpdateChecksEnabled(_ isEnabled: Bool) {
         automaticUpdateChecksEnabled = isEnabled
     }
@@ -1022,13 +1051,32 @@ private final class PreferencesSwiftUIViewModel: ObservableObject {
     var versionUpdatePresentation: PreferencesVersionUpdatePresentation {
         PreferencesVersionUpdatePresentation.make(
             status: updateStatus,
-            currentVersionText: aboutVersionText()
+            currentVersionText: aboutVersionText(),
+            installState: installState
         )
     }
 
+    /// 「立即更新」：在应用内下载并替换，完成后自动重启。
     func openVersionUpdate() {
         guard case .available(let release) = updateStatus else { return }
+        guard !installState.isBusy else { return }
         onUpdateReleaseRequested?(release)
+    }
+
+    /// 「打开发布页」：想手动下载或看完整说明时使用。
+    func openVersionReleasePage() {
+        guard case .available(let release) = updateStatus else { return }
+        onUpdateReleasePageRequested?(release)
+    }
+
+    var canCheckForUpdates: Bool {
+        !installState.isBusy && !isCheckingForUpdates
+    }
+
+    func checkForUpdatesManually() {
+        guard canCheckForUpdates else { return }
+        isCheckingForUpdates = true
+        onManualUpdateCheckRequested?()
     }
 
     func setAutomaticUpdateChecksEnabled(_ isEnabled: Bool) {
@@ -1206,17 +1254,73 @@ struct PreferencesVersionUpdatePresentation: Equatable {
     let detail: String
     let value: String
     let isActionable: Bool
+    /// 有无可用更新（用于在网页展示醒目的「有新版本」）。
+    let hasAvailableUpdate: Bool
+    /// 安装进度或错误；nil 表示未在安装。
+    let installStatusText: String?
+    let installFraction: Double?
+    let installFailed: Bool
+    let isInstalling: Bool
 
     static func make(
         status: AppUpdateSettingsStatus,
-        currentVersionText: String
+        currentVersionText: String,
+        installState: AppUpdateInstallState = .idle
     ) -> PreferencesVersionUpdatePresentation {
+        switch installState {
+        case .downloading(let progress):
+            return PreferencesVersionUpdatePresentation(
+                detail: progress?.statusText ?? AppLocalization.text(
+                    "update.install.downloading",
+                    defaultValue: "正在下载更新…"
+                ),
+                value: currentVersionText,
+                isActionable: false,
+                hasAvailableUpdate: false,
+                installStatusText: progress?.statusText,
+                installFraction: progress?.fraction,
+                installFailed: false,
+                isInstalling: true
+            )
+        case .installed:
+            return PreferencesVersionUpdatePresentation(
+                detail: AppLocalization.text(
+                    "update.install.completed",
+                    defaultValue: "安装完成，正在重新启动 ClipDock…"
+                ),
+                value: currentVersionText,
+                isActionable: false,
+                hasAvailableUpdate: false,
+                installStatusText: nil,
+                installFraction: 1,
+                installFailed: false,
+                isInstalling: true
+            )
+        case .failed(let message):
+            return PreferencesVersionUpdatePresentation(
+                detail: AppLocalization.format(
+                    "preferences.version.installFailed.detail",
+                    defaultValue: "更新失败：%@",
+                    message
+                ),
+                value: currentVersionText,
+                isActionable: true,
+                hasAvailableUpdate: true,
+                installStatusText: message,
+                installFraction: nil,
+                installFailed: true,
+                isInstalling: false
+            )
+        case .idle:
+            break
+        }
+
         switch status {
         case .available(let release):
             return PreferencesVersionUpdatePresentation(
                 detail: AppLocalization.format(
                     "preferences.version.updateAvailable.detail",
-                    defaultValue: "发现新版本 %@，点击打开发布页面",
+                    defaultValue: "发现新版本 %@，可直接在应用内更新",
                     release.displayVersion
                 ),
                 value: AppLocalization.format(
@@ -1224,7 +1328,12 @@ struct PreferencesVersionUpdatePresentation: Equatable {
                     defaultValue: "有更新 %@",
                     release.displayVersion
                 ),
-                isActionable: true
+                isActionable: true,
+                hasAvailableUpdate: true,
+                installStatusText: nil,
+                installFraction: nil,
+                installFailed: false,
+                isInstalling: false
             )
         case .checking:
             return PreferencesVersionUpdatePresentation(
@@ -1233,7 +1342,12 @@ struct PreferencesVersionUpdatePresentation: Equatable {
                     defaultValue: "正在检查更新"
                 ),
                 value: currentVersionText,
-                isActionable: false
+                isActionable: false,
+                hasAvailableUpdate: false,
+                installStatusText: nil,
+                installFraction: nil,
+                installFailed: false,
+                isInstalling: false
             )
         case .idle, .upToDate:
             return PreferencesVersionUpdatePresentation(
@@ -1242,7 +1356,12 @@ struct PreferencesVersionUpdatePresentation: Equatable {
                     defaultValue: "当前应用版本"
                 ),
                 value: currentVersionText,
-                isActionable: false
+                isActionable: false,
+                hasAvailableUpdate: false,
+                installStatusText: nil,
+                installFraction: nil,
+                installFailed: false,
+                isInstalling: false
             )
         }
     }
@@ -2931,26 +3050,76 @@ private struct PreferenceAboutSection: View {
                 let presentation = model.versionUpdatePresentation
                 PreferenceRow(
                     title: AppLocalization.text("preferences.version.title", defaultValue: "版本"),
-                    detail: presentation.detail,
-                    action: presentation.isActionable ? { model.openVersionUpdate() } : nil
+                    detail: presentation.detail
                 ) {
-                    PreferenceValuePill(presentation.value, isProminent: presentation.isActionable)
+                    PreferenceValuePill(presentation.value, isProminent: presentation.hasAvailableUpdate)
+                }
+                if presentation.hasAvailableUpdate || presentation.isInstalling || presentation.installFailed {
+                    PreferenceDivider()
+                    VStack(alignment: .leading, spacing: 10) {
+                        if let fraction = presentation.installFraction, presentation.isInstalling {
+                            ProgressView(value: fraction)
+                                .progressViewStyle(.linear)
+                        } else if presentation.isInstalling {
+                            ProgressView()
+                                .progressViewStyle(.linear)
+                                .frame(maxWidth: 260)
+                        }
+                        HStack(spacing: 10) {
+                            if presentation.isInstalling {
+                                Text(presentation.installStatusText ?? presentation.detail)
+                                    .font(.system(size: 12.5))
+                                    .foregroundStyle(colors.secondaryText)
+                            } else {
+                                Button(AppLocalization.text(
+                                    "update.action.installNow",
+                                    defaultValue: "立即更新"
+                                )) {
+                                    model.openVersionUpdate()
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+
+                                Button(AppLocalization.text(
+                                    "update.action.openReleasePage",
+                                    defaultValue: "打开发布页"
+                                )) {
+                                    model.openVersionReleasePage()
+                                }
+                                .controlSize(.small)
+                            }
+                            Spacer(minLength: 0)
+                        }
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 14)
                 }
                 PreferenceDivider()
                 PreferenceRow(
                     title: AppLocalization.text("preferences.updateChecks.title", defaultValue: "检查更新"),
                     detail: AppLocalization.text("preferences.updateChecks.detail", defaultValue: "自动检查新版本并在可用时提醒")
                 ) {
-                    Toggle(
-                        "",
-                        isOn: Binding(
-                            get: { model.automaticUpdateChecksEnabled },
-                            set: { isOn in model.setAutomaticUpdateChecksEnabled(isOn) }
+                    HStack(spacing: 10) {
+                        Button(AppLocalization.text(
+                            "update.action.checkNow",
+                            defaultValue: "检查"
+                        )) {
+                            model.checkForUpdatesManually()
+                        }
+                        .controlSize(.small)
+                        .disabled(!model.canCheckForUpdates)
+
+                        Toggle(
+                            "",
+                            isOn: Binding(
+                                get: { model.automaticUpdateChecksEnabled },
+                                set: { isOn in model.setAutomaticUpdateChecksEnabled(isOn) }
+                            )
                         )
-                    )
-                    .labelsHidden()
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                    }
                 }
             }
         }

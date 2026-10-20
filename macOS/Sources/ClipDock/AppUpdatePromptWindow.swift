@@ -13,11 +13,28 @@ final class AppUpdatePromptWindowPresenter: AppUpdatePromptPresenting {
             release: release,
             currentVersion: currentVersion
         ) { [weak self] controller, action in
-            self?.activeControllers.removeAll { $0 === controller }
+            // 开始安装后窗口要留着显示进度，只有「稍后 / 跳过」才关闭。
+            if action != .download {
+                self?.activeControllers.removeAll { $0 === controller }
+            }
             onAction(action)
         }
         activeControllers.append(controller)
         controller.present()
+    }
+
+    func updateInstallState(_ state: AppUpdateInstallState) {
+        for controller in activeControllers {
+            controller.updateInstallState(state)
+        }
+    }
+
+    var hasActivePrompt: Bool {
+        !activeControllers.isEmpty
+    }
+
+    func dismissAll() {
+        activeControllers.removeAll()
     }
 }
 
@@ -29,7 +46,12 @@ private final class AppUpdatePromptWindowController: NSWindowController, NSWindo
     }
 
     private var didComplete = false
+    private weak var contentView: AppUpdatePromptContentView?
     private let onCompletion: (AppUpdatePromptWindowController, AppUpdatePromptAction) -> Void
+
+    func updateInstallState(_ state: AppUpdateInstallState) {
+        contentView?.updateInstallState(state)
+    }
 
     init(
         release: AppUpdateRelease,
@@ -51,13 +73,15 @@ private final class AppUpdatePromptWindowController: NSWindowController, NSWindo
 
         super.init(window: window)
         window.delegate = self
-        window.contentView = AppUpdatePromptContentView(
+        let contentView = AppUpdatePromptContentView(
             release: release,
             currentVersion: currentVersion,
             onAction: { [weak self] action in
                 self?.complete(action)
             }
         )
+        self.contentView = contentView
+        window.contentView = contentView
         window.initialFirstResponder = window.contentView
     }
 
@@ -93,7 +117,7 @@ private final class AppUpdatePromptWindowController: NSWindowController, NSWindo
 }
 
 @MainActor
-private final class AppUpdatePromptContentView: NSVisualEffectView {
+final class AppUpdatePromptContentView: NSVisualEffectView {
     private enum Layout {
         static let contentInsets = NSEdgeInsets(top: 72, left: 42, bottom: 32, right: 42)
         static let iconSize: CGFloat = 72
@@ -104,6 +128,12 @@ private final class AppUpdatePromptContentView: NSVisualEffectView {
     }
 
     private let onAction: (AppUpdatePromptAction) -> Void
+    private var installButton: NSButton?
+    private var remindButton: NSButton?
+    private var skipButton: NSButton?
+    private var progressIndicator: NSProgressIndicator?
+    private var progressLabel: NSTextField?
+    private var installState: AppUpdateInstallState = .idle
 
     init(
         release: AppUpdateRelease,
@@ -142,9 +172,11 @@ private final class AppUpdatePromptContentView: NSVisualEffectView {
 
         let header = makeHeader(release: release, currentVersion: currentVersion)
         let releaseNotes = makeReleaseNotesView(for: release)
+        let progress = makeProgressView()
         let footer = makeFooter()
         rootStack.addArrangedSubview(header)
         rootStack.addArrangedSubview(releaseNotes)
+        rootStack.addArrangedSubview(progress)
         rootStack.addArrangedSubview(footer)
 
         NSLayoutConstraint.activate([
@@ -154,8 +186,96 @@ private final class AppUpdatePromptContentView: NSVisualEffectView {
             rootStack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -Layout.contentInsets.bottom),
             header.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
             releaseNotes.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
+            progress.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
             footer.widthAnchor.constraint(equalTo: rootStack.widthAnchor)
         ])
+    }
+
+    /// 安装进度行：默认隐藏，点「安装更新」后才出现。
+    private func makeProgressView() -> NSView {
+        let container = NSStackView()
+        container.orientation = .vertical
+        container.alignment = .leading
+        container.spacing = 6
+        container.isHidden = true
+
+        let indicator = NSProgressIndicator()
+        indicator.style = .bar
+        indicator.isIndeterminate = false
+        indicator.minValue = 0
+        indicator.maxValue = 1
+        indicator.translatesAutoresizingMaskIntoConstraints = false
+        indicator.heightAnchor.constraint(equalToConstant: 8).isActive = true
+
+        let label = NSTextField(labelWithString: "")
+        label.font = .systemFont(ofSize: 12.5)
+        label.textColor = .secondaryLabelColor
+        label.lineBreakMode = .byWordWrapping
+        label.maximumNumberOfLines = 2
+
+        container.addArrangedSubview(label)
+        container.addArrangedSubview(indicator)
+        indicator.widthAnchor.constraint(equalTo: container.widthAnchor).isActive = true
+
+        progressIndicator = indicator
+        progressLabel = label
+        return container
+    }
+
+    func updateInstallState(_ state: AppUpdateInstallState) {
+        installState = state
+        guard let installButton, let remindButton, let skipButton else { return }
+
+        switch state {
+        case .idle:
+            progressIndicator?.superview?.isHidden = true
+            installButton.isEnabled = true
+            installButton.title = AppLocalization.text("update.prompt.install", defaultValue: "安装更新")
+            remindButton.isEnabled = true
+            skipButton.isEnabled = true
+
+        case .downloading(let progress):
+            progressIndicator?.superview?.isHidden = false
+            installButton.isEnabled = false
+            installButton.title = AppLocalization.text("update.install.inProgress", defaultValue: "正在安装…")
+            remindButton.isEnabled = false
+            skipButton.isEnabled = false
+            progressLabel?.stringValue = progress?.statusText
+                ?? AppLocalization.text("update.install.downloading", defaultValue: "正在下载更新…")
+            progressLabel?.textColor = .secondaryLabelColor
+            if let fraction = progress?.fraction {
+                progressIndicator?.isIndeterminate = false
+                progressIndicator?.doubleValue = fraction
+            } else {
+                progressIndicator?.isIndeterminate = true
+                progressIndicator?.startAnimation(nil)
+            }
+
+        case .installed:
+            progressIndicator?.superview?.isHidden = false
+            installButton.isEnabled = false
+            installButton.title = AppLocalization.text("update.install.done", defaultValue: "正在重启…")
+            remindButton.isEnabled = false
+            skipButton.isEnabled = false
+            progressLabel?.stringValue = AppLocalization.text(
+                "update.install.completed",
+                defaultValue: "安装完成，正在重新启动 ClipDock…"
+            )
+            progressLabel?.textColor = .secondaryLabelColor
+            progressIndicator?.isIndeterminate = false
+            progressIndicator?.doubleValue = 1
+
+        case .failed(let message):
+            progressIndicator?.superview?.isHidden = false
+            installButton.isEnabled = true
+            installButton.title = AppLocalization.text("update.install.retry", defaultValue: "重试")
+            remindButton.isEnabled = true
+            skipButton.isEnabled = true
+            progressLabel?.stringValue = message
+            progressLabel?.textColor = .systemRed
+            progressIndicator?.isIndeterminate = false
+            progressIndicator?.doubleValue = 0
+        }
     }
 
     private func makeHeader(release: AppUpdateRelease, currentVersion: String) -> NSView {
@@ -271,6 +391,10 @@ private final class AppUpdatePromptContentView: NSVisualEffectView {
         )
         installButton.keyEquivalent = "\r"
 
+        self.skipButton = skipButton
+        self.remindButton = remindButton
+        self.installButton = installButton
+
         let spacer = NSView()
         spacer.translatesAutoresizingMaskIntoConstraints = false
 
@@ -307,15 +431,24 @@ private final class AppUpdatePromptContentView: NSVisualEffectView {
     }
 
     @objc private func installUpdate() {
+        // 安装进行中不重复触发；失败后按钮会变成「重试」。
+        guard !installState.isBusy, !isInstalled else { return }
         onAction(.download)
     }
 
     @objc private func remindLater() {
+        guard !installState.isBusy else { return }
         onAction(.skipForNow)
     }
 
     @objc private func skipVersion() {
+        guard !installState.isBusy else { return }
         onAction(.skipVersion)
+    }
+
+    private var isInstalled: Bool {
+        if case .installed = installState { return true }
+        return false
     }
 }
 
