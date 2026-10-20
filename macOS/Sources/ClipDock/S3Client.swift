@@ -71,6 +71,8 @@ enum S3SyncError: LocalizedError, Equatable {
     case invalidEndpoint
     case missingSecretKey
     case invalidResponse
+    case bucketNotFound(bucket: String)
+    case accessDenied(status: Int, message: String?)
     case http(status: Int, message: String?)
     case transport(String)
 
@@ -84,6 +86,17 @@ enum S3SyncError: LocalizedError, Equatable {
             return AppLocalization.text("s3.error.missingSecret", defaultValue: "请先填写 Secret Access Key")
         case .invalidResponse:
             return AppLocalization.text("s3.error.invalidResponse", defaultValue: "服务端返回了无法解析的响应")
+        case .bucketNotFound(let bucket):
+            return AppLocalization.format(
+                "s3.error.bucketNotFound",
+                defaultValue: "存储桶「%@」不存在，请在服务商控制台确认名称与区域",
+                bucket
+            )
+        case .accessDenied(let status, let message):
+            if let message, !message.isEmpty {
+                return "\(AppLocalization.text("s3.error.accessDenied", defaultValue: "访问被拒绝，请检查 Access Key 权限"))（HTTP \(status)：\(message)）"
+            }
+            return AppLocalization.text("s3.error.accessDenied", defaultValue: "访问被拒绝，请检查 Access Key 权限")
         case .http(let status, let message):
             if let message, !message.isEmpty {
                 return "HTTP \(status)：\(message)"
@@ -115,9 +128,30 @@ struct S3Client: Sendable {
     }
 
     /// 远端对象是否存在，以及最后修改时间（用于判断是否需要先下载）。
+    /// 404 表示对象尚未创建，不是错误。
     func head() async throws -> Date? {
-        let response = try await send(method: "HEAD", payload: Data(), contentType: nil, returnsBody: false)
-        return response.lastModified
+        do {
+            let response = try await send(method: "HEAD", payload: Data(), contentType: nil, returnsBody: false)
+            return response.lastModified
+        } catch S3SyncError.http(let status, _) where status == 404 {
+            // HEAD 不返回响应体，无法区分 NoSuchBucket；桶是否存在由 verifyAccess 前置校验。
+            return nil
+        }
+    }
+
+    /// 校验凭据与存储桶是否可用。
+    ///
+    /// 同步前先做一次 ListObjectsV2，这样「桶不存在 / 密钥无效 / 区域不对」
+    /// 会得到明确提示，而不是等到上传时抛出一个裸的 HTTP 404。
+    func verifyAccess() async throws {
+        _ = try await send(
+            method: "GET",
+            payload: Data(),
+            contentType: nil,
+            returnsBody: false,
+            query: "list-type=2&max-keys=0",
+            urlOverride: bucketRootURL()
+        )
     }
 
     // MARK: - 请求
@@ -132,7 +166,9 @@ struct S3Client: Sendable {
         method: String,
         payload: Data,
         contentType: String?,
-        returnsBody: Bool = true
+        returnsBody: Bool = true,
+        query: String? = nil,
+        urlOverride: URL? = nil
     ) async throws -> Response {
         guard configuration.isComplete else {
             throw S3SyncError.incompleteConfiguration
@@ -141,8 +177,8 @@ struct S3Client: Sendable {
             throw S3SyncError.missingSecretKey
         }
         guard let endpointURL = configuration.endpointURL,
-              let host = endpointURL.host,
-              let url = objectURL(endpointURL: endpointURL) else {
+              endpointURL.host != nil,
+              let url = urlOverride ?? objectURL(endpointURL: endpointURL) else {
             throw S3SyncError.invalidEndpoint
         }
 
@@ -169,7 +205,7 @@ struct S3Client: Sendable {
         let canonicalRequest = [
             method,
             Self.canonicalURI(path: url.path),
-            Self.canonicalQuery(url.query),
+            Self.canonicalQuery(query ?? url.query),
             canonicalHeaders,
             signedHeadersValue,
             payloadHash
@@ -192,7 +228,12 @@ struct S3Client: Sendable {
         let authorization = "AWS4-HMAC-SHA256 Credential=\(configuration.accessKeyID)/\(scope), "
             + "SignedHeaders=\(signedHeadersValue), Signature=\(signature)"
 
-        var request = URLRequest(url: url)
+        var requestURL = url
+        if let query, !query.isEmpty, var components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+            components.percentEncodedQuery = query
+            requestURL = components.url ?? url
+        }
+        var request = URLRequest(url: requestURL)
         request.httpMethod = method
         request.timeoutInterval = 60
         for (name, value) in headers where name != "host" {
@@ -214,14 +255,73 @@ struct S3Client: Sendable {
             throw S3SyncError.invalidResponse
         }
         guard (200..<300).contains(http.statusCode) else {
-            let message = data.isEmpty ? nil : String(data: data, encoding: .utf8)
-            throw S3SyncError.http(status: http.statusCode, message: message?.prefix(300).description)
+            let body = data.isEmpty ? nil : String(data: data, encoding: .utf8)
+            let message = body.flatMap { Self.errorMessage(fromXML: $0) }
+            let bucket = configuration.bucket.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            // 把 S3 的错误码翻译成可操作的提示，而不是把 XML 直接甩给用户。
+            if message?.contains("NoSuchBucket") == true {
+                throw S3SyncError.bucketNotFound(bucket: bucket)
+            }
+            if http.statusCode == 403 {
+                throw S3SyncError.accessDenied(status: http.statusCode, message: message)
+            }
+            if http.statusCode == 404, method != "HEAD" {
+                // GET/PUT 的 404 通常也是桶名写错（部分实现不返回 NoSuchBucket）。
+                throw S3SyncError.bucketNotFound(bucket: bucket)
+            }
+            throw S3SyncError.http(status: http.statusCode, message: message)
         }
 
         let modified = http.value(forHTTPHeaderField: "Last-Modified").flatMap {
             Self.httpDateFormatter.date(from: $0)
         }
         return Response(data: returnsBody ? data : Data(), status: http.statusCode, lastModified: modified)
+    }
+
+    /// 从 S3 的 XML 错误体里提取 `Code: Message`，取不到就退回截断后的原文。
+    /// HEAD 请求没有响应体，返回 nil。
+    static func errorMessage(fromXML body: String) -> String? {
+        let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        func value(of tag: String) -> String? {
+            guard let start = trimmed.range(of: "<\(tag)>"),
+                  let end = trimmed.range(of: "</\(tag)>", range: start.upperBound..<trimmed.endIndex)
+            else { return nil }
+            return String(trimmed[start.upperBound..<end.lowerBound])
+        }
+
+        if let code = value(of: "Code") {
+            if let message = value(of: "Message"), !message.isEmpty {
+                return "\(code): \(message)"
+            }
+            return code
+        }
+        return String(trimmed.prefix(300))
+    }
+
+    /// 桶根路径，用于 ListObjectsV2 校验。
+    private func bucketRootURL() -> URL? {
+        guard let endpointURL = configuration.endpointURL else { return nil }
+        let bucket = configuration.bucket.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !bucket.isEmpty else { return nil }
+
+        guard var components = URLComponents(url: endpointURL, resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+        var path = components.path
+        while path.hasSuffix("/") {
+            path.removeLast()
+        }
+        if configuration.usesPathStyle {
+            path += "/\(bucket)"
+        } else {
+            guard let host = components.host else { return nil }
+            components.host = "\(bucket).\(host)"
+        }
+        components.path = path
+        return components.url
     }
 
     private func objectURL(endpointURL: URL) -> URL? {

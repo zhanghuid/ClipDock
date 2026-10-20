@@ -54,6 +54,19 @@ struct S3ClientIntegrationTests {
     }
 
     @Test
+    func verifyAccessSucceedsForExistingBucket() async throws {
+        guard isServerAvailable else { return }
+
+        var configuration = S3SyncConfiguration()
+        configuration.endpoint = "http://127.0.0.1:9100"
+        configuration.bucket = "testbucket"
+        configuration.accessKeyID = "testkey"
+
+        let client = S3Client(configuration: configuration, secretAccessKey: "testsecret")
+        try await client.verifyAccess()
+    }
+
+    @Test
     func missingCredentialsAreRejectedBeforeNetworkCall() async throws {
         var configuration = S3SyncConfiguration()
         configuration.endpoint = "http://127.0.0.1:9100"

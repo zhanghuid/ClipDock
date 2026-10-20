@@ -80,6 +80,32 @@ struct S3ClientTests {
         #expect(configuration.isComplete)
     }
 
+    @Test
+    func errorMessageExtractsCodeAndMessageFromS3XML() {
+        let body = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist.</Message></Error>
+        """
+        #expect(
+            S3Client.errorMessage(fromXML: body)
+                == "NoSuchBucket: The specified bucket does not exist."
+        )
+    }
+
+    @Test
+    func errorMessageFallsBackToRawBodyWithoutCode() {
+        #expect(S3Client.errorMessage(fromXML: "<html>oops</html>") == "<html>oops</html>")
+        #expect(S3Client.errorMessage(fromXML: "   ") == nil)
+    }
+
+    @Test
+    func bucketNotFoundErrorNamesTheBucket() {
+        let error = S3SyncError.bucketNotFound(bucket: "clipdock-sync")
+        let description = error.errorDescription ?? ""
+        #expect(description.contains("clipdock-sync"))
+        #expect(description.contains("不存在"))
+    }
+
     private static func derive(secret: String, dateStamp: String, region: String) -> Data {
         S3Client.signingKeyValue(secretAccessKey: secret, dateStamp: dateStamp, region: region)
     }

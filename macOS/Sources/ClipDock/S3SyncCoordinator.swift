@@ -201,6 +201,9 @@ final class S3SyncCoordinator {
             throw S3SyncError.missingSecretKey
         }
         let client = S3Client(configuration: configuration, secretAccessKey: secret)
+        // 先确认桶存在且凭据可用；否则后续 HEAD 的 404 会被误判为「远端还没有快照」，
+        // 上传时又只抛出一个含义不明的 HTTP 404。
+        try await client.verifyAccess()
 
         let temporaryURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("clipdock-s3-\(UUID().uuidString).clipdock")
