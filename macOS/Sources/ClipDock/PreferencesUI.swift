@@ -817,6 +817,19 @@ private final class PreferencesSwiftUIViewModel: ObservableObject {
         preferenceSection(for: state.selectedSection)
     }
 
+    /// 分区变化通知，发出的是界面分区。
+    ///
+    /// `@Published` 在 willSet 阶段发布，回调里读 `state` 会拿到旧值；
+    /// 这里改为对发布者传入的新值做映射，订阅方无需再读 `state`。
+    var selectedSectionUpdates: AnyPublisher<PreferenceSection, Never> {
+        $state
+            .map { [weak self] state in
+                self?.preferenceSection(for: state.selectedSection) ?? .general
+            }
+            .removeDuplicates()
+            .eraseToAnyPublisher()
+    }
+
     var forcedAppearance: NSAppearance? {
         switch state.preferences.appearance.mode {
         case "light":
@@ -1562,11 +1575,10 @@ private final class PreferencesContentContainerController: NSViewController {
         self.model = model
         super.init(nibName: nil, bundle: nil)
         // 分区变化时只切换显隐，不重建页面。
-        contentObservation = model.$state
-            .map(\.selectedSection)
-            .removeDuplicates()
-            .sink { [weak self] _ in
-                self?.syncVisiblePage()
+        // 使用发布者传来的新分区，避免 willSet 时序导致页面慢一拍。
+        contentObservation = model.selectedSectionUpdates
+            .sink { [weak self] section in
+                self?.syncVisiblePage(for: section)
             }
     }
 
@@ -1582,12 +1594,17 @@ private final class PreferencesContentContainerController: NSViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        syncVisiblePage()
+        syncVisiblePage(for: model.selectedSection)
     }
 
     func syncVisiblePage() {
+        syncVisiblePage(for: model.selectedSection)
+    }
+
+    /// `section` 必须由调用方显式传入：`@Published` 在 willSet 阶段发出通知，
+    /// 回调内读取 `model.state` 会拿到旧值。
+    private func syncVisiblePage(for section: PreferenceSection) {
         guard isViewLoaded else { return }
-        let section = model.selectedSection
         guard section != currentSection else { return }
 
         let controller = pageController(for: section)

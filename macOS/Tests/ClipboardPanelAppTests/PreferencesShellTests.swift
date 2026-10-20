@@ -119,6 +119,12 @@ struct PreferencesShellTests {
 
         controller.showSection(.history)
         #expect(try #require(controller.preferencesShellSmokeSnapshot()).selectedSection == .general)
+
+        controller.showSection(.sync)
+        #expect(try #require(controller.preferencesShellSmokeSnapshot()).selectedSection == .sync)
+
+        controller.showSection(.about)
+        #expect(try #require(controller.preferencesShellSmokeSnapshot()).selectedSection == .about)
     }
 
     @Test

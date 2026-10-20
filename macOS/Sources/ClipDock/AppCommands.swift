@@ -40,6 +40,8 @@ private enum PreferencesCommandArguments {
             return .shortcuts
         case "privacy", "rules":
             return .rules
+        case "sync", "s3":
+            return .sync
         case "about":
             return .about
         default:
