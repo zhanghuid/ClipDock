@@ -750,6 +750,9 @@ private final class PreferencesSwiftUIViewModel: ObservableObject {
     @Published var s3Configuration = S3SyncConfiguration()
     @Published private(set) var s3HasSecretKey = false
     @Published private(set) var s3SecretKeyError: String?
+    @Published private(set) var s3ConfigurationHasUnsavedChanges = false
+    @Published private(set) var s3SaveConfirmation: String?
+    private var s3SaveConfirmationToken = UUID()
     @Published var s3State: S3SyncState = .idle
     @Published var s3AutomaticEnabled = false
     @Published var s3IntervalMinutes = 30
@@ -850,15 +853,57 @@ private final class PreferencesSwiftUIViewModel: ObservableObject {
 
     func loadS3Settings() {
         guard let store = s3SettingsStore else { return }
+        applyLoadedS3Settings(from: store)
+    }
+
+    private func applyLoadedS3Settings(from store: S3SettingsStore) {
         s3Configuration = store.configuration
         s3HasSecretKey = store.hasSecretAccessKey
         s3AutomaticEnabled = store.isAutomaticSyncEnabled
         s3IntervalMinutes = store.automaticSyncIntervalMinutes
+        s3ConfigurationHasUnsavedChanges = false
+        s3SecretKeyError = nil
+        s3SaveConfirmation = nil
     }
 
-    func saveS3Configuration() {
-        s3SettingsStore?.configuration = s3Configuration
+    /// 输入过程中就标记为「未保存」，不必等失焦。
+    func markS3ConfigurationEdited() {
+        s3ConfigurationHasUnsavedChanges = true
+        s3SaveConfirmation = nil
+    }
+
+    /// 保存连接配置（Endpoint/Bucket/凭据等），返回是否确实写入了变更。
+    @discardableResult
+    func saveS3Configuration() -> Bool {
+        guard let store = s3SettingsStore else { return false }
+        let newConfiguration = s3Configuration
+        guard store.configuration != newConfiguration else {
+            s3ConfigurationHasUnsavedChanges = false
+            return false
+        }
+        store.configuration = newConfiguration
+        s3ConfigurationHasUnsavedChanges = false
         onS3ConfigurationChanged?()
+        return true
+    }
+
+    func discardS3ConfigurationChanges() {
+        guard let store = s3SettingsStore else { return }
+        s3Configuration = store.configuration
+        s3ConfigurationHasUnsavedChanges = false
+        s3SaveConfirmation = nil
+    }
+
+    /// 保存后短暂显示确认，避免用户不确定是否真的写入。
+    func flashS3SavedConfirmation() {
+        s3SaveConfirmation = AppLocalization.text("s3.saved", defaultValue: "已保存")
+        let token = UUID()
+        s3SaveConfirmationToken = token
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard let self, self.s3SaveConfirmationToken == token else { return }
+            self.s3SaveConfirmation = nil
+        }
     }
 
     func setS3SecretKey(_ value: String) {
@@ -2130,11 +2175,17 @@ private struct PreferenceS3SyncSection: View {
     }
 
     private var canRunActions: Bool {
-        model.s3IsConfigured && !model.s3IsBusy
+        model.s3IsConfigured && !model.s3IsBusy && !model.s3ConfigurationHasUnsavedChanges
     }
 
     private var disabledReason: String? {
-        model.s3MissingConfigurationDescription
+        if model.s3ConfigurationHasUnsavedChanges {
+            return AppLocalization.text(
+                "s3.config.unsavedFirst",
+                defaultValue: "请先保存连接配置，再执行同步"
+            )
+        }
+        return model.s3MissingConfigurationDescription
     }
 
     var body: some View {
@@ -2147,10 +2198,10 @@ private struct PreferenceS3SyncSection: View {
                     PreferenceTextInputField(
                         value: model.s3Configuration.endpoint,
                         placeholder: "例如 https://s3.example.com",
-                        width: nil
+                        width: nil,
+                        onEdit: { model.markS3ConfigurationEdited() }
                     ) { value in
                         model.s3Configuration.endpoint = value
-                        model.saveS3Configuration()
                     }
                 }
                 PreferenceDivider()
@@ -2161,10 +2212,10 @@ private struct PreferenceS3SyncSection: View {
                     PreferenceTextInputField(
                         value: model.s3Configuration.region,
                         placeholder: "us-east-1",
-                        width: nil
+                        width: nil,
+                        onEdit: { model.markS3ConfigurationEdited() }
                     ) { value in
                         model.s3Configuration.region = value.isEmpty ? "us-east-1" : value
-                        model.saveS3Configuration()
                     }
                 }
                 PreferenceDivider()
@@ -2175,10 +2226,10 @@ private struct PreferenceS3SyncSection: View {
                     PreferenceTextInputField(
                         value: model.s3Configuration.bucket,
                         placeholder: "例如 clipdock-sync",
-                        width: nil
+                        width: nil,
+                        onEdit: { model.markS3ConfigurationEdited() }
                     ) { value in
                         model.s3Configuration.bucket = value
-                        model.saveS3Configuration()
                     }
                 }
                 PreferenceDivider()
@@ -2189,13 +2240,17 @@ private struct PreferenceS3SyncSection: View {
                     PreferenceTextInputField(
                         value: model.s3Configuration.objectKey,
                         placeholder: S3SyncConfiguration.defaultObjectKey,
-                        width: nil
+                        width: nil,
+                        onEdit: { model.markS3ConfigurationEdited() }
                     ) { value in
                         model.s3Configuration.objectKey = value.isEmpty
                             ? S3SyncConfiguration.defaultObjectKey
                             : value
-                        model.saveS3Configuration()
                     }
+                }
+                if model.s3ConfigurationHasUnsavedChanges || model.s3SaveConfirmation != nil {
+                    PreferenceDivider()
+                    S3SaveBar(model: model)
                 }
             }
 
@@ -2207,10 +2262,10 @@ private struct PreferenceS3SyncSection: View {
                     PreferenceTextInputField(
                         value: model.s3Configuration.accessKeyID,
                         placeholder: "AKIA…",
-                        width: nil
+                        width: nil,
+                        onEdit: { model.markS3ConfigurationEdited() }
                     ) { value in
                         model.s3Configuration.accessKeyID = value
-                        model.saveS3Configuration()
                     }
                 }
                 PreferenceDivider()
@@ -2343,6 +2398,55 @@ private struct PreferenceS3SyncSection: View {
                 }
             }
         }
+    }
+}
+
+/// 连接配置的保存栏：有改动时显示未保存标记与「保存更改」，保存后短暂显示确认。
+private struct S3SaveBar: View {
+    @ObservedObject var model: PreferencesSwiftUIViewModel
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var colors: PreferencesThemeValues {
+        PreferencesThemeValues(colorScheme: colorScheme)
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            if model.s3ConfigurationHasUnsavedChanges {
+                Image(systemName: "circle.fill")
+                    .font(.system(size: 7))
+                    .foregroundStyle(Color.orange)
+                Text(AppLocalization.text("s3.unsaved", defaultValue: "有未保存的更改"))
+                    .font(.system(size: 12.5))
+                    .foregroundStyle(colors.secondaryText)
+            } else if let confirmation = model.s3SaveConfirmation {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Color.green)
+                Text(confirmation)
+                    .font(.system(size: 12.5))
+                    .foregroundStyle(colors.secondaryText)
+            }
+
+            Spacer(minLength: 0)
+
+            Button(AppLocalization.text("s3.discard", defaultValue: "撤销更改")) {
+                model.discardS3ConfigurationChanges()
+            }
+            .controlSize(.small)
+            .disabled(!model.s3ConfigurationHasUnsavedChanges)
+
+            Button(AppLocalization.text("s3.save", defaultValue: "保存更改")) {
+                if model.saveS3Configuration() {
+                    model.flashS3SavedConfirmation()
+                }
+            }
+            .controlSize(.small)
+            .keyboardShortcut("s", modifiers: .command)
+            .disabled(!model.s3ConfigurationHasUnsavedChanges)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
     }
 }
 
@@ -3165,6 +3269,8 @@ private struct PreferenceTextInputField: View {
     let value: String
     let placeholder: String
     let width: CGFloat?
+    /// 每次键入都回调，用于立刻标记「未保存」，不必等失焦。
+    let onEdit: (() -> Void)?
     let onCommit: (String) -> Void
 
     @State private var text: String
@@ -3174,11 +3280,13 @@ private struct PreferenceTextInputField: View {
         value: String,
         placeholder: String,
         width: CGFloat?,
+        onEdit: (() -> Void)? = nil,
         onCommit: @escaping (String) -> Void
     ) {
         self.value = value
         self.placeholder = placeholder
         self.width = width
+        self.onEdit = onEdit
         self.onCommit = onCommit
         _text = State(initialValue: value)
     }
@@ -3195,6 +3303,12 @@ private struct PreferenceTextInputField: View {
             .focused($isFocused)
             .onSubmit(commit)
             .onDisappear(perform: commit)
+            .onChange(of: text) { nextText in
+                // 只在用户真的改了内容时标记；外部同步 value 引起的回写不算改动。
+                if nextText != value {
+                    onEdit?()
+                }
+            }
             .onChange(of: isFocused) { focused in
                 if !focused {
                     commit()
