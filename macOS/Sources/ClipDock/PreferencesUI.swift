@@ -2960,7 +2960,9 @@ struct IgnoredApplicationRuleResolver {
     }
 }
 
-struct IgnoredApplicationDescriptor: Identifiable {
+/// 不可变值类型，只在主线程消费；`NSImage` 创建后不可变，可安全跨线程传递，
+/// 因此显式标注 `@unchecked Sendable` 以便在后台解析后回传。
+struct IgnoredApplicationDescriptor: Identifiable, @unchecked Sendable {
     let id: String
     let displayName: String
     let detail: String

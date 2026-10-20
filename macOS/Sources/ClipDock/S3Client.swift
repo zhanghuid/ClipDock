@@ -119,7 +119,7 @@ struct S3Client: Sendable {
 
     func upload(fileURL: URL) async throws {
         let body = try Data(contentsOf: fileURL, options: .mappedIfSafe)
-        try await send(method: "PUT", payload: body, contentType: "application/octet-stream")
+        _ = try await send(method: "PUT", payload: body, contentType: "application/octet-stream")
     }
 
     func download(to destinationURL: URL) async throws {
